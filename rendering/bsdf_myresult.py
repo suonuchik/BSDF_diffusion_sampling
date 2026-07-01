@@ -7,11 +7,15 @@ from tqdm import tqdm
 import torch
 from utils.model import *
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 import os
 import sys
-p = os.path.abspath('.')
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+p = str(SCRIPT_DIR)
 sys.path.insert(1, p)
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 from utils.mitsuba_brdf_draw import *
 from utils.analytical_brdf_torch import *
 from utils.mlp_brdf_sampling import *
@@ -59,11 +63,13 @@ class MyBSDF(mi.BSDF):
         self.bsdf = bsdf_materials[self.idx]
         
         self.D_sample = NN_cond_pos(input_dim=6,output_dim=2,N_NEURONS=32,POSITIONAL_ENCODING_BASIS_NUM=5).to("cuda")
-        self.D_sample.load_state_dict(torch.load(f"checkpoints_new/bsdf_{self.idx}_spherical/brdf_rectify_network{self.idx}.pth"))
+        rectify_path = SCRIPT_DIR / "checkpoints_new" / f"bsdf_{self.idx}_spherical" / f"brdf_rectify_network{self.idx}.pth"
+        self.D_sample.load_state_dict(torch.load(str(rectify_path)))
         self.D_sample.eval()
         
         self.D_base = NN_cond_pretrain_spherical_one(input_dim=2,N_NEURONS=16).to("cuda")
-        self.D_base.load_state_dict(torch.load(f"checkpoints_new/bsdf_{self.idx}_spherical/brdf_pretrain_network{self.idx}.pth"))
+        pretrain_path = SCRIPT_DIR / "checkpoints_new" / f"bsdf_{self.idx}_spherical" / f"brdf_pretrain_network{self.idx}.pth"
+        self.D_base.load_state_dict(torch.load(str(pretrain_path)))
         
         reflection_flags = mi.BSDFFlags.Diffuse | mi.BSDFFlags.FrontSide | mi.BSDFFlags.BackSide
         self.m_components = [reflection_flags]
@@ -159,7 +165,18 @@ if __name__ == "__main__":
     start_time = time.time()
     mi.register_bsdf("mybsdf", lambda props: MyBSDF(props))
 
-    scene_path = os.path.join("matpreview", parser.scene_file)
+    scene_file = parser.scene_file
+    if not scene_file.lower().endswith(".xml"):
+        scene_file += ".xml"
+
+    if os.path.isabs(scene_file) or os.path.dirname(scene_file):
+        scene_path = os.path.abspath(scene_file)
+    else:
+        scene_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "matpreview", scene_file))
+
+    if not os.path.exists(scene_path):
+        raise FileNotFoundError(f"Scene file does not exist: {scene_path}")
+
     scene = mi.load_file(scene_path)
 
     # print(params)
@@ -174,8 +191,11 @@ if __name__ == "__main__":
         seed += 1
     image /= (spp // SPP) + 1
     
+    output_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "diffusion_bsdf_myresult"))
+    os.makedirs(output_dir, exist_ok=True)
+
     # gtfilepath_exr = os.path.join(path, "roughdielectric0.2"+"8196.exr")
-    filepath = os.path.join("diffusion_bsdf_myresult", f"{parser.scene_file}.png")
+    filepath = os.path.join(output_dir, f"{parser.scene_file}.png")
     mi.util.write_bitmap(filepath, image, spp)
-    filepath = os.path.join("diffusion_bsdf_myresult", f"{parser.scene_file}.exr")
+    filepath = os.path.join(output_dir, f"{parser.scene_file}.exr")
     mi.util.write_bitmap(filepath, image, spp)

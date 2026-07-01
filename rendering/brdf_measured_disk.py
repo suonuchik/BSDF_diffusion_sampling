@@ -7,10 +7,13 @@ from tqdm import tqdm
 import torch
 from utils.model import *
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+from pathlib import Path
 import os
 import sys
-p = os.path.abspath('.')
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+p = str(SCRIPT_DIR)
 sys.path.insert(1, p)
 from utils.mitsuba_brdf_draw import *
 from utils.mlp_brdf_sampling import *
@@ -41,23 +44,30 @@ class MyBSDF(mi.BSDF):
     def __init__(self, props):
         mi.BSDF.__init__(self, props)
         material = props["filename"]
-        self.bsdf = meaturedbsdf(os.path.join("measuredbsdfs",material+".bsdf"))
+        measured_path = SCRIPT_DIR / "measuredbsdfs" / f"{material}.bsdf"
+        if not measured_path.exists():
+            raise FileNotFoundError(f"Measured BSDF file does not exist: {measured_path}")
+
+        self.bsdf = meaturedbsdf(str(measured_path))
         self.bsdf = mi.load_dict(
             {
                 "type":"measured",
-                "filename":"./measuredbsdfs/"+material+".bsdf"
-
+                "filename": str(measured_path)
             }
         )
         self.D_sample = NN_cond_pos_simpler(input_dim=5,output_dim=2,N_NEURONS=32,POSITIONAL_ENCODING_BASIS_NUM=5).to("cuda")
-        #self.D_sample.load_state_dict(torch.load("./disk_ckpt/" + material+"_new/rectfied_1_pos_diffusion_brdf6553664256.pth"))
-        self.D_sample.load_state_dict(torch.load("./checkpoints_new/" + material+"_disk/"+"brdf_rectify_network" + material+".pth"))
+        self.D_sample_path = SCRIPT_DIR / "checkpoints_new" / f"{material}_disk" / f"brdf_rectify_network{material}.pth"
+        if not self.D_sample_path.exists():
+            raise FileNotFoundError(f"Sample checkpoint does not exist: {self.D_sample_path}")
+        self.D_sample.load_state_dict(torch.load(str(self.D_sample_path)))
 
         self.D_sample.eval()
         
         self.D_base = NN_cond_pretrain_disk_one(input_dim=2,N_NEURONS=16,POSITIONAL_ENCODING_BASIS_NUM=3).to("cuda")
-        #self.D_base.load_state_dict(torch.load("./disk_ckpt/"+material+"_new/brdf_pretrain_onemode"+material+".pth"))
-        self.D_base.load_state_dict(torch.load("./checkpoints_new/" + material+"_disk/"+"brdf_pretrain_network" + material+".pth"))
+        self.D_base_path = SCRIPT_DIR / "checkpoints_new" / f"{material}_disk" / f"brdf_pretrain_network{material}.pth"
+        if not self.D_base_path.exists():
+            raise FileNotFoundError(f"Base checkpoint does not exist: {self.D_base_path}")
+        self.D_base.load_state_dict(torch.load(str(self.D_base_path)))
         
         
         self.albedo = mi.Color3f([1, 1,1]) 
@@ -147,10 +157,16 @@ if __name__ == "__main__":
     start_time = time.time()
 
     mi.register_bsdf("mybsdf", lambda props: MyBSDF(props))
-    
-    scene_path = os.path.join("matpreview", parser.scene_file)
-    # scene = mi.load_file("./disney_bsdf_test/disney_diffuse.xml")
-    scene = mi.load_file(scene_path)
+
+    scene_file = parser.scene_file
+    if not scene_file.lower().endswith(".xml"):
+        scene_file += ".xml"
+
+    scene_path = SCRIPT_DIR / "matpreview" / scene_file
+    if not scene_path.exists():
+        raise FileNotFoundError(f"Scene file does not exist: {scene_path}")
+
+    scene = mi.load_file(str(scene_path))
     # print(params)
     SPP = 4
     spp = SPP * parser.passes
@@ -164,11 +180,13 @@ if __name__ == "__main__":
         seed += 1
     image /= (spp // SPP) + 1
 
-    filepath = os.path.join("diffusion_brdf_measured_disk", f"{parser.scene_file}.png")
-    mi.util.write_bitmap(filepath, image)
+    output_dir = SCRIPT_DIR / "diffusion_brdf_measured_disk"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filepath = output_dir / f"{parser.scene_file}.png"
+    mi.util.write_bitmap(str(filepath), image)
     
-    filepath_exr = os.path.join("diffusion_brdf_measured_disk", f"{parser.scene_file}.exr")
-    mi.util.write_bitmap(filepath_exr, image)
+    filepath_exr = output_dir / f"{parser.scene_file}.exr"
+    mi.util.write_bitmap(str(filepath_exr), image)
     end_time = time.time()
     print("Render time: " + str(end_time - start_time) + " seconds")
     

@@ -7,10 +7,11 @@ from tqdm import tqdm
 import torch
 from utils.model import *
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+from pathlib import Path
 import os
 import sys
-p = os.path.abspath('.')
+SCRIPT_DIR = Path(__file__).resolve().parent
+p = str(SCRIPT_DIR)
 sys.path.insert(1, p)
 from utils.mitsuba_brdf_draw import *
 from utils.analytical_brdf_torch import *
@@ -53,27 +54,31 @@ class MyBSDF(mi.BSDF):
     def __init__(self, props):
         mi.BSDF.__init__(self, props)
         material = props["filename"]
-        self.bsdf = meaturedbsdf(os.path.join("measuredbsdfs",material+".bsdf"))
+        measured_path = SCRIPT_DIR / "measuredbsdfs" / f"{material}.bsdf"
+        if not measured_path.exists():
+            raise FileNotFoundError(f"Measured BSDF file does not exist: {measured_path}")
+
+        self.bsdf = meaturedbsdf(str(measured_path))
         self.bsdf = mi.load_dict(
             {
-                "type":"measured",
-                "filename":"./measuredbsdfs/"+material+".bsdf"
-
+                "type": "measured",
+                "filename": str(measured_path)
             }
         )
-        self.D_sample = NN_cond_pos(input_dim=6,output_dim=2,N_NEURONS=32,POSITIONAL_ENCODING_BASIS_NUM=5).to("cuda")
-
-        self.D_sample.load_state_dict(torch.load("./checkpoints_new/" + material+"_spherical/"+"brdf_rectify_network" + material+".pth"))
+        self.D_sample = NN_cond_pos(input_dim=6, output_dim=2, N_NEURONS=32, POSITIONAL_ENCODING_BASIS_NUM=5).to("cuda")
+        self.D_sample_path = SCRIPT_DIR / "checkpoints_new" / f"{material}_spherical" / f"brdf_rectify_network{material}.pth"
+        if not self.D_sample_path.exists():
+            raise FileNotFoundError(f"Sample checkpoint does not exist: {self.D_sample_path}")
+        self.D_sample.load_state_dict(torch.load(str(self.D_sample_path)))
         self.D_sample.eval()
-        
-        
-        self.D_base = NN_cond_pretrain_spherical_one(input_dim=2,N_NEURONS=16).to("cuda")
-        self.D_base.load_state_dict(torch.load("./checkpoints_new/" + material+"_spherical/"+"brdf_pretrain_network" + material+".pth"))
 
-        #self.D_base.load_state_dict(torch.load("./checkpoints/checkpoints/aniso_miro_7_rgb/brdf_pretrainaniso_miro_7_rgb.pth"))
-        
-        
-        self.albedo = mi.Color3f([1, 1,1]) 
+        self.D_base = NN_cond_pretrain_spherical_one(input_dim=2, N_NEURONS=16).to("cuda")
+        self.D_base_path = SCRIPT_DIR / "checkpoints_new" / f"{material}_spherical" / f"brdf_pretrain_network{material}.pth"
+        if not self.D_base_path.exists():
+            raise FileNotFoundError(f"Base checkpoint does not exist: {self.D_base_path}")
+        self.D_base.load_state_dict(torch.load(str(self.D_base_path)))
+
+        self.albedo = mi.Color3f([1, 1, 1])
         reflection_flags = mi.BSDFFlags.DeltaReflection | mi.BSDFFlags.FrontSide
         self.m_components = [reflection_flags]
         self.m_flags = reflection_flags
@@ -163,9 +168,15 @@ if __name__ == "__main__":
 
     mi.register_bsdf("mybsdf", lambda props: MyBSDF(props))
 
-    
-    scene_path = os.path.join("matpreview", parser.scene_file)
-    scene = mi.load_file(scene_path)
+    scene_file = parser.scene_file
+    if not scene_file.lower().endswith(".xml"):
+        scene_file += ".xml"
+
+    scene_path = SCRIPT_DIR / "matpreview" / scene_file
+    if not scene_path.exists():
+        raise FileNotFoundError(f"Scene file does not exist: {scene_path}")
+
+    scene = mi.load_file(str(scene_path))
     
     SPP = 4
     spp = SPP * parser.passes
@@ -179,11 +190,13 @@ if __name__ == "__main__":
         seed += 1
     image /= (spp // SPP) + 1
 
-    filepath = os.path.join("diffusion_brdf_measured_spherical", f"{parser.scene_file}.png")
-    mi.util.write_bitmap(filepath, image)
+    output_dir = SCRIPT_DIR / "diffusion_brdf_measured_spherical"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filepath = output_dir / f"{parser.scene_file}.png"
+    mi.util.write_bitmap(str(filepath), image)
     
-    filepath_exr = os.path.join("diffusion_brdf_measured_spherical", f"{parser.scene_file}.exr")
-    mi.util.write_bitmap(filepath_exr, image)
+    filepath_exr = output_dir / f"{parser.scene_file}.exr"
+    mi.util.write_bitmap(str(filepath_exr), image)
     end_time = time.time()
     print("Render time: " + str(end_time - start_time) + " seconds")
     
