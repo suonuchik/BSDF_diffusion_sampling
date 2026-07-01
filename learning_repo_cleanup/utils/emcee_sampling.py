@@ -70,7 +70,12 @@ def find_omegao(omegai, pdf_func,is_spherical = False):
     return omegao
 
 def find_omegao_bsdf(omegai, pdf_func):
+    cnt = 0
     while True:
+        cnt += 1
+
+        if cnt % 100 == 0:
+            print(cnt)
         
         omegao = stratified_sampling_2d(1)
         omegao[:,0] = omegao[:,0] * np.pi 

@@ -25,14 +25,26 @@ import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--scene_file", type=str, default="scene_measured.xml")
+parser.add_argument("--passes", type=int, default=128)
 
 parser = parser.parse_args()
+
+def to_mi_float(tensor):
+    return mi.Float(tensor.detach().cpu().numpy())
+
+def as_points(tensor):
+    if tensor.ndim == 2 and tensor.shape[0] == 3 and tensor.shape[1] != 3:
+        return tensor.transpose(0, 1)
+    return tensor
 
 def sph_to_dir(theta, phi):
     st, ct = dr.sincos(theta)
     sp, cp = dr.sincos(phi)
     return mi.Vector3f(cp * st, sp * st, ct)
 def cart_to_spher(xyz):
+    xyz = as_points(xyz)
+    if xyz.ndim == 2 and xyz.shape[1] == 2:
+        return xyz
     r = torch.norm(xyz, dim=1)
     theta = torch.acos(xyz[:,2]/(r+1e-8))
     phi = torch.atan2(xyz[:,1], xyz[:,0])
@@ -56,7 +68,7 @@ class MyBSDF(mi.BSDF):
         
         
         self.D_base = NN_cond_pretrain_spherical_one(input_dim=2,N_NEURONS=16).to("cuda")
-        self.D_base.load_state_dict(torch.load("./checkpoints_new/" + material+"_disk/"+"brdf_pretrain_network" + material+".pth"))
+        self.D_base.load_state_dict(torch.load("./checkpoints_new/" + material+"_spherical/"+"brdf_pretrain_network" + material+".pth"))
 
         #self.D_base.load_state_dict(torch.load("./checkpoints/checkpoints/aniso_miro_7_rgb/brdf_pretrainaniso_miro_7_rgb.pth"))
         
@@ -73,12 +85,12 @@ class MyBSDF(mi.BSDF):
 
         active &= cos_theta_i > 0
 
-        wi = si.wi.torch()
+        wi = as_points(si.wi.torch())
         wi_input = cart_to_spher(wi)
         wo,pdf = network_sampling_spherical(self.D_base,self.D_sample,wi_input)
         pdf = torch.where(torch.sin(wo[:,0]) > 0.00005, pdf, torch.zeros_like(pdf))
         pdf = torch.where(torch.cos(wo[:,0]) > 0, pdf, torch.zeros_like(pdf))
-        wo = mi.Vector2f(wo[...,0], wo[...,1])
+        wo = mi.Vector2f(to_mi_float(wo[...,0]), to_mi_float(wo[...,1]))
         wo = sph_to_dir(wo.x, wo.y)
         
         bs = mi.BSDFSample3f()
@@ -88,24 +100,24 @@ class MyBSDF(mi.BSDF):
         
         floatmax = mi.Float(np.array([np.finfo(np.float32).max]))
         invsin_theta_o =dr.clamp(1/ (mi.Frame3f.sin_theta(bs.wo)) ,1,floatmax)
-        bs.pdf = mi.Float(pdf) * invsin_theta_o
+        bs.pdf = to_mi_float(pdf) * invsin_theta_o
         # bs.wo = mi.warp.square_to_cosine_hebrdf_onlyphere(sample2)
         # bs.pdf = mi.warp.square_to_cosine_hebrdf_onlyphere_pdf(bs.wo)
         bs.eta = 1.0
         bs.sampled_type = mi.UInt32(+self.m_flags)
         bs.sampled_component = 0
         
-        wi_input = si.wi.torch()[...,:2]
-        wo_tmp = bs.wo.torch()[...,:2]
+        wi_input = as_points(si.wi.torch())[...,:2]
+        wo_tmp = as_points(bs.wo.torch())[...,:2]
         #brdf = self.bsdf.eval(wi_input, wo_tmp)
         brdf = self.bsdf.eval(ctx, si, bs.wo)
         value = brdf / bs.pdf  * self.albedo 
         #value = brdf  * self.albedo / mi.Float(pdf) * mi.Frame3f.sin_theta(bs.wo)
 
         value = dr.select(active & (bs.pdf > 0.0), value, mi.Vector3f(0))
-        value_torch = rgb2lum(value).torch()
+        value_torch = as_points(rgb2lum(value).torch())
         pdf = torch.where(value_torch<30, pdf, torch.zeros_like(pdf))
-        bs.pdf = mi.Float(pdf) * invsin_theta_o
+        bs.pdf = to_mi_float(pdf) * invsin_theta_o
         return (bs, dr.select(active & (bs.pdf > 0.0) & (cos_theta_o > 0), value, mi.Vector3f(0)))
 
     def eval(self, ctx, si, wo, active=True):
@@ -126,14 +138,14 @@ class MyBSDF(mi.BSDF):
         floatmax = mi.Float(np.array([np.finfo(np.float32).max]))
         
         invsin_theta_o =dr.clamp(1/ (mi.Frame3f.sin_theta(wo)) ,1,floatmax)
-        wi = si.wi.torch()
+        wi = as_points(si.wi.torch())
         wi_input = cart_to_spher(wi)
-        wo = wo.torch()
+        wo = as_points(wo.torch())
         wo_input = cart_to_spher(wo)
         pdf = network_pdf_spherical(self.D_base,self.D_sample,wo_input,wi_input) 
         pdf = torch.where(torch.sin(wo_input[:,0]) > 0.00005, pdf, torch.zeros_like(pdf))
         return dr.select(
-            (cos_theta_i > 0.0) & (cos_theta_o > 0.0), mi.Float(pdf)* invsin_theta_o, mi.Float(0)
+            (cos_theta_i > 0.0) & (cos_theta_o > 0.0), to_mi_float(pdf)* invsin_theta_o, mi.Float(0)
         )
 
     def eval_pdf(self, ctx, si, wo, active=True):
@@ -156,7 +168,7 @@ if __name__ == "__main__":
     scene = mi.load_file(scene_path)
     
     SPP = 4
-    spp = SPP * 128
+    spp = SPP * parser.passes
 
     seed = 0
     

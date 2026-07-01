@@ -15,6 +15,7 @@ sys.path.insert(1, p)
 from utils.mitsuba_brdf_draw import *
 from utils.analytical_brdf_torch import *
 from utils.mlp_brdf_sampling import *
+import argparse
 
 torch.set_default_dtype(torch.float32)
 mi.set_variant("cuda_ad_rgb")
@@ -24,16 +25,28 @@ dr.set_flag(dr.JitFlag.LoopRecord, False)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--scene_file", type=str, default="scene_bsdf.xml")
+parser.add_argument("--passes", type=int, default=128)
 
 parser = parser.parse_args()
 
 from utils.bsdf_dict import *
+
+def to_mi_float(tensor):
+    return mi.Float(tensor.detach().cpu().numpy())
+
+def as_points(tensor):
+    if tensor.ndim == 2 and tensor.shape[0] == 3 and tensor.shape[1] != 3:
+        return tensor.transpose(0, 1)
+    return tensor
 
 def sph_to_dir(theta, phi):
     st, ct = dr.sincos(theta)
     sp, cp = dr.sincos(phi)
     return mi.Vector3f(cp * st, sp * st, ct)
 def cart_to_spher(xyz):
+    xyz = as_points(xyz)
+    if xyz.ndim == 2 and xyz.shape[1] == 2:
+        return xyz
     r = torch.norm(xyz, dim=1)
     theta = torch.acos(xyz[:,2]/(r+1e-8))
     phi = torch.atan2(xyz[:,1], xyz[:,0])
@@ -62,14 +75,14 @@ class MyBSDF(mi.BSDF):
 
         active &= cos_theta_i > 0
 
-        wi = si.wi.torch()
+        wi = as_points(si.wi.torch())
         wi_input = cart_to_spher(wi)
         
         wo,pdf = network_sampling_spherical(self.D_base,self.D_sample,wi_input,T=8)
         pdf = torch.where(torch.sin(wo[:,0]) > 0.00005, pdf, torch.zeros_like(pdf))
 
         # print("Time1: ", time1)        
-        wo = mi.Vector2f(wo[...,0], wo[...,1])
+        wo = mi.Vector2f(to_mi_float(wo[...,0]), to_mi_float(wo[...,1]))
         wo = sph_to_dir(wo.x, wo.y)
         
         bs = mi.BSDFSample3f()
@@ -81,7 +94,7 @@ class MyBSDF(mi.BSDF):
         invsin_theta_o =dr.clamp(1/ (dr.abs(mi.Frame3f.sin_theta(bs.wo))) ,1,floatmax)
         if dr.any_nested(invsin_theta_o<0):
             print("invsin_theta_o<0")
-        bs.pdf = mi.Float(pdf) * invsin_theta_o
+        bs.pdf = to_mi_float(pdf) * invsin_theta_o
         # (bs, value) = self.bsdf.sample(ctx, si, sample1, sample2, active=True)
         # bs.wo = mi.warp.square_to_cosine_hemisphere(sample2)
         # bs.pdf = mi.warp.square_to_cosine_hemisphere_pdf(bs.wo)
@@ -90,17 +103,17 @@ class MyBSDF(mi.BSDF):
         bs.sampled_type = dr.select((mi.Frame3f.cos_theta(bs.wo) > 0.0), 8, 16)
         
         
-        wi_input = si.wi.torch()[...,:2]
-        wo_tmp = bs.wo.torch()[...,:2]
+        wi_input = as_points(si.wi.torch())[...,:2]
+        wo_tmp = as_points(bs.wo.torch())[...,:2]
         #brdf = self.bsdf.eval(wi_input, wo_tmp)
         brdf = self.bsdf.eval(ctx, si, bs.wo)
-        value = brdf * self.albedo / mi.Float(pdf) * mi.Frame3f.sin_theta(bs.wo)
+        value = brdf * self.albedo / to_mi_float(pdf) * mi.Frame3f.sin_theta(bs.wo)
         value = dr.select((bs.pdf > 0.0), value, mi.Vector3f(0))
         # print("value1: ", value1)
         pdf = bs.pdf.torch()
-        value_torch = value.torch()[:,0]
+        value_torch = as_points(value.torch())[:,0]
         pdf = torch.where(value_torch<3.5, pdf, torch.zeros_like(pdf))
-        bs.pdf = mi.Float(pdf) 
+        bs.pdf = to_mi_float(pdf) 
         return (bs, dr.select((bs.pdf > 0.0) , value, mi.Vector3f(0)))
 
     def eval(self, ctx, si, wo, active=True):
@@ -114,15 +127,15 @@ class MyBSDF(mi.BSDF):
 
     def pdf(self, ctx, si, wo, active=True):
 
-        wi = si.wi.torch()
+        wi = as_points(si.wi.torch())
         wi_input = cart_to_spher(wi)
-        wo = wo.torch()
-        wo_input = cart_to_spher(wo)
+        wo_torch = as_points(wo.torch())
+        wo_input = cart_to_spher(wo_torch)
         pdf = network_pdf_spherical(self.D_base,self.D_sample,wo_input,wi_input,T=8) 
         floatmax = mi.Float(np.array([np.finfo(np.float32).max]))
         # pdf = torch.where(torch.sin(wo_input[:,0]) > 0.00005, pdf, torch.zeros_like(pdf))
         invsin_theta_o =dr.clamp(1/ (dr.abs(mi.Frame3f.sin_theta(wo))) ,1,floatmax)
-        pdf = mi.Float(pdf) * invsin_theta_o
+        pdf = to_mi_float(pdf) * invsin_theta_o
         # # pdf = self.bsdf.pdf(ctx, si, wo)
         # value =  self.bsdf.eval(ctx, si, wo) / mi.Float(pdf) 
         # # print("value1: ", value1)
@@ -151,7 +164,7 @@ if __name__ == "__main__":
 
     # print(params)
     SPP = 4
-    spp = SPP * 128
+    spp = SPP * parser.passes
 
     seed = 0
     image = mi.render(scene, spp=SPP, seed=seed).numpy()

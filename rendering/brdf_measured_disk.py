@@ -25,8 +25,17 @@ import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--scene_file", type=str, default="disney_bsdf_array0_envmap.xml")
+parser.add_argument("--passes", type=int, default=128)
 
 parser = parser.parse_args()
+
+def to_mi_float(tensor):
+    return mi.Float(tensor.detach().cpu().numpy())
+
+def as_points(tensor):
+    if tensor.ndim == 2 and tensor.shape[0] == 3 and tensor.shape[1] != 3:
+        return tensor.transpose(0, 1)
+    return tensor
 
 class MyBSDF(mi.BSDF):
     def __init__(self, props):
@@ -63,7 +72,7 @@ class MyBSDF(mi.BSDF):
 
         active &= cos_theta_i > 0
 
-        wi = si.wi.torch()
+        wi = as_points(si.wi.torch())
         wi_input = wi[...,:2]
         wo,pdf = network_sampling_disk(self.D_base,self.D_sample,wi_input)
         valid = torch.square(wo[...,0]) + torch.square(wo[...,1]) < 0.995
@@ -72,32 +81,32 @@ class MyBSDF(mi.BSDF):
         
         wo_dr = disk_to_cart(wo)
         
-        wo = mi.Vector3f(wo_dr[...,0], wo_dr[...,1], wo_dr[...,2])
+        wo = mi.Vector3f(to_mi_float(wo_dr[...,0]), to_mi_float(wo_dr[...,1]), to_mi_float(wo_dr[...,2]))
         bs = mi.BSDFSample3f()
         
         
         
         bs.wo = wo           
         cos_theta_o = mi.Frame3f.cos_theta(bs.wo)
-        bs.pdf = mi.Float(pdf) * cos_theta_o
+        bs.pdf = to_mi_float(pdf) * cos_theta_o
         # bs.wo = mi.warp.square_to_cosine_hebrdf_onlyphere(sample2)
         # bs.pdf = mi.warp.square_to_cosine_hebrdf_onlyphere_pdf(bs.wo)
         bs.eta = 1.0
         bs.sampled_type = mi.UInt32(+self.m_flags)
         bs.sampled_component = 0
         
-        wi_input = si.wi.torch()[...,:2]
-        wo_tmp = bs.wo.torch()[...,:2]
+        wi_input = as_points(si.wi.torch())[...,:2]
+        wo_tmp = as_points(bs.wo.torch())[...,:2]
         #brdf = self.bsdf.eval(wi_input, wo_tmp)
         brdf = self.bsdf.eval(ctx, si, bs.wo)
         value = brdf / bs.pdf * self.albedo   
 
         # if dr.any_nested(dr.isnan(bs.wo)):
         #     print("nan pdf"
-        value_torch = rgb2lum(value).torch()
+        value_torch = as_points(rgb2lum(value).torch())
         pdf = torch.where(value_torch<30, pdf, torch.zeros_like(pdf))
 
-        bs.pdf = mi.Float(pdf) * cos_theta_o
+        bs.pdf = to_mi_float(pdf) * cos_theta_o
         return (bs, dr.select(active & (bs.pdf > 0.0) & (cos_theta_o > 0), value, mi.Vector3f(0)))
 
     def eval(self, ctx, si, wo, active=True):
@@ -113,14 +122,14 @@ class MyBSDF(mi.BSDF):
 
         cos_theta_i = mi.Frame3f.cos_theta(si.wi)
         cos_theta_o = mi.Frame3f.cos_theta(wo)
-        wi = si.wi.torch()
+        wi = as_points(si.wi.torch())
         wi_input = wi[...,:2]
-        wo = wo.torch()
+        wo = as_points(wo.torch())
         wo_input = wo[...,:2]
         pdf = network_pdf_disk(self.D_base,self.D_sample,wo_input,wi_input) 
         
         return dr.select(
-            (cos_theta_i > 0.0) & (cos_theta_o > 0.0), mi.Float(pdf)* cos_theta_o, mi.Float(0)
+            (cos_theta_i > 0.0) & (cos_theta_o > 0.0), to_mi_float(pdf)* cos_theta_o, mi.Float(0)
         )
 
     def eval_pdf(self, ctx, si, wo, active=True):
@@ -144,7 +153,7 @@ if __name__ == "__main__":
     scene = mi.load_file(scene_path)
     # print(params)
     SPP = 4
-    spp = SPP * 128
+    spp = SPP * parser.passes
 
     seed = 0
     

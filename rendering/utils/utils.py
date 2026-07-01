@@ -9,8 +9,6 @@ from scipy.stats import norm,uniform
 from scipy.stats import truncnorm
 from scipy.integrate import quad,quad_vec
 from scipy import signal
-import OpenEXR
-import Imath
 import numpy as np
 
 image_path = './images/'
@@ -29,6 +27,9 @@ def export(x, filename, pdf_func,loc=-1,scale=2):
 
 
 def read_exr(filename):
+    import OpenEXR
+    import Imath
+
     # 打开EXR文件
     exr_file = OpenEXR.InputFile(filename)
     # 读取图片的元数据

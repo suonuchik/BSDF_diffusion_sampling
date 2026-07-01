@@ -2,11 +2,12 @@ import drjit as dr
 import mitsuba as mi
 import torch
 mi.set_variant('cuda_ad_rgb')
-import OpenEXR
-import Imath
 import numpy as np
 
 def read_exr(filename):
+    import OpenEXR
+    import Imath
+
     # 打开EXR文件
     exr_file = OpenEXR.InputFile(filename)
     # 读取图片的元数据
