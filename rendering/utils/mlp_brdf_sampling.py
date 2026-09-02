@@ -1,5 +1,5 @@
 # %%
-import imageio 
+import imageio
 import matplotlib.pyplot
 import numpy as np
 import torch
@@ -14,17 +14,22 @@ import ast
 
 
 import time
+
+# Device is set by the caller (bsdf_myresult.py) based on available Mitsuba variant.
+# Defaults to CUDA if available; caller may override this module-level variable to
+# force CPU when running with llvm_ad_rgb to avoid nanothread assertion failures.
+_torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 def network_sampling_disk(D_base,D_sample,omega_i,T = 4):
     x_target_y = omega_i
     total_time = 0
     x_alpha = D_base.sample(x_target_y,x_target_y.shape[0])
-    tmp_J = torch.ones(x_alpha.shape[0],device='cuda')
-    ones = torch.ones(x_alpha.shape[0],1,device='cuda').reshape(-1,1)
-    zeros = torch.zeros(x_alpha.shape[0],1,device='cuda').reshape(-1,1)
+    tmp_J = torch.ones(x_alpha.shape[0],device=_torch_device)
+    ones = torch.ones(x_alpha.shape[0],1,device=_torch_device).reshape(-1,1)
+    zeros = torch.zeros(x_alpha.shape[0],1,device=_torch_device).reshape(-1,1)
     x_alpha_pdf = D_base.log_prob(x_alpha,x_target_y).exp()    
     x_alpha = x_alpha.detach().requires_grad_(True)
     for t in (range(T)):
-        alpha = ( t / T) * torch.ones(x_alpha.shape[0], 1, device="cuda")
+        alpha = ( t / T) * torch.ones(x_alpha.shape[0], 1, device=_torch_device)
         if x_alpha.grad is not None:
             x_alpha.grad.zero_()
         
@@ -54,10 +59,10 @@ def network_sampling_disk(D_base,D_sample,omega_i,T = 4):
 def network_sampling_disk_tiny(x_alpha,D_sample,omega_i,T = 4):
     x_target_y = omega_i
     
-    tmp_J = torch.ones(x_alpha.shape[0],device='cuda')
+    tmp_J = torch.ones(x_alpha.shape[0],device=_torch_device)
     with torch.no_grad():
         for t in (range(T)):
-            alpha = ( t / T) * torch.ones(x_alpha.shape[0], 1, device="cuda")
+            alpha = ( t / T) * torch.ones(x_alpha.shape[0], 1, device=_torch_device)
             x_input = torch.cat([x_alpha,alpha,x_target_y],dim = 1)
             d_output = D_sample(x_input)
             d_output = D_sample(x_input)
@@ -68,14 +73,14 @@ def network_sampling_disk_tiny(x_alpha,D_sample,omega_i,T = 4):
     return x_alpha, x_target_pdf
 def network_pdf_disk(D_base,D_sample,omega_o,omega_i,T = 4):
     omega_o = omega_o.detach()
-    x_alpha = omega_o.to("cuda",dtype=torch.float32).requires_grad_(True)
+    x_alpha = omega_o.to(_torch_device, dtype=torch.float32).requires_grad_(True)
     x_target_y = omega_i
-    tmp_J = torch.ones(x_alpha.shape[0],device='cuda')
-    ones = torch.ones(x_alpha.shape[0],1,device='cuda').reshape(-1,1)
-    zeros = torch.zeros(x_alpha.shape[0],1,device='cuda').reshape(-1,1)
+    tmp_J = torch.ones(x_alpha.shape[0],device=_torch_device)
+    ones = torch.ones(x_alpha.shape[0],1,device=_torch_device).reshape(-1,1)
+    zeros = torch.zeros(x_alpha.shape[0],1,device=_torch_device).reshape(-1,1)
     
     for t in (range(T)):
-        alpha = (1 - t / T) * torch.ones(x_alpha.shape[0], 1, device="cuda")
+        alpha = (1 - t / T) * torch.ones(x_alpha.shape[0], 1, device=_torch_device)
         if x_alpha.grad is not None:
             x_alpha.grad.zero_()
         d_output = D_sample(x_alpha, alpha,x_target_y)
@@ -106,14 +111,14 @@ def network_pdf_disk(D_base,D_sample,omega_o,omega_i,T = 4):
 def network_sampling_spherical(D_base,D_sample,omega_i,T = 8):
     x_target_y = omega_i
     x_alpha = D_base.sample(x_target_y,x_target_y.shape[0])
-    tmp_J = torch.ones(x_alpha.shape[0],device='cuda')
-    ones = torch.ones(x_alpha.shape[0],1,device='cuda').reshape(-1,1)
-    zeros = torch.zeros(x_alpha.shape[0],1,device='cuda').reshape(-1,1)
+    tmp_J = torch.ones(x_alpha.shape[0],device=_torch_device)
+    ones = torch.ones(x_alpha.shape[0],1,device=_torch_device).reshape(-1,1)
+    zeros = torch.zeros(x_alpha.shape[0],1,device=_torch_device).reshape(-1,1)
     x_alpha_pdf = D_base.log_prob(x_alpha,x_target_y).exp()    
     x_alpha = x_alpha.detach().requires_grad_(True)
     
     for t in (range(T)):
-        alpha = ( t / T) * torch.ones(x_alpha.shape[0], 1, device="cuda")
+        alpha = ( t / T) * torch.ones(x_alpha.shape[0], 1, device=_torch_device)
         if x_alpha.grad is not None:
             x_alpha.grad.zero_()
         x_alpha_predioc = torch.cat([torch.sin( x_alpha[:,1]).reshape(-1,1),torch.cos( x_alpha[:,1]).reshape(-1,1)],dim=1)
@@ -143,14 +148,14 @@ def network_sampling_spherical(D_base,D_sample,omega_i,T = 8):
 
 def network_pdf_spherical(D_base,D_sample,omega_o,omega_i,T = 8):
     omega_o = omega_o.detach()
-    x_alpha = omega_o.to("cuda",dtype=torch.float32).requires_grad_(True)
+    x_alpha = omega_o.to(_torch_device, dtype=torch.float32).requires_grad_(True)
     x_target_y = omega_i
-    tmp_J = torch.ones(x_alpha.shape[0],device='cuda')
-    ones = torch.ones(x_alpha.shape[0],1,device='cuda').reshape(-1,1)
-    zeros = torch.zeros(x_alpha.shape[0],1,device='cuda').reshape(-1,1)
+    tmp_J = torch.ones(x_alpha.shape[0],device=_torch_device)
+    ones = torch.ones(x_alpha.shape[0],1,device=_torch_device).reshape(-1,1)
+    zeros = torch.zeros(x_alpha.shape[0],1,device=_torch_device).reshape(-1,1)
     
     for t in (range(T)):
-        alpha = (1 - t / T) * torch.ones(x_alpha.shape[0], 1, device="cuda")
+        alpha = (1 - t / T) * torch.ones(x_alpha.shape[0], 1, device=_torch_device)
         if x_alpha.grad is not None:
             x_alpha.grad.zero_()
         x_alpha_predioc = torch.cat([torch.sin( x_alpha[:,1]).reshape(-1,1),torch.cos( x_alpha[:,1]).reshape(-1,1)],dim=1)

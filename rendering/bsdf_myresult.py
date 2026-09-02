@@ -7,7 +7,6 @@ from tqdm import tqdm
 import torch
 from utils.model import *
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 import os
 import sys
 p = os.path.abspath('.')
@@ -17,22 +16,55 @@ from utils.analytical_brdf_torch import *
 from utils.mlp_brdf_sampling import *
 
 torch.set_default_dtype(torch.float32)
-mi.set_variant("cuda_ad_rgb")
+_mi_variant = None
+for _variant in ("cuda_ad_rgb", "llvm_ad_rgb"):
+    try:
+        mi.set_variant(_variant)
+        _mi_variant = _variant
+        print(f"Mitsuba variant: {_variant}")
+        break
+    except Exception as _exc:
+        print(f"Mitsuba variant {_variant} failed: {_exc}", file=sys.stderr)
+
+# When using llvm_ad_rgb, PyTorch ops inside DrJIT worker threads cause
+# nanothread assertion failures. Force single thread and CPU device to avoid this.
+if _mi_variant == "cuda_ad_rgb" and torch.cuda.is_available():
+    device = torch.device("cuda:0")
+else:
+    device = torch.device("cpu")
+    # Restrict DrJIT LLVM thread pool to 1 so Python callbacks are not called
+    # from multiple threads simultaneously (prevents nanothread assertion).
+    dr.set_thread_count(1)
+
+# Propagate device choice to mlp_brdf_sampling so its internal tensors match
+import utils.mlp_brdf_sampling as _mlp_mod
+_mlp_mod._torch_device = device
+
 dr.set_flag(dr.JitFlag.VCallRecord, False)
 dr.set_flag(dr.JitFlag.LoopRecord, False)
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--scene_file", type=str, default="scene_bsdf.xml")
+parser.add_argument("--passes", type=int, default=128)
 
 parser = parser.parse_args()
 
 from utils.bsdf_dict import *
 
+
+def to_mi_float(tensor):
+    # mi.Float(cuda_tensor) only works with cuda_ad_rgb.
+    # Using .cpu().numpy() works for both cuda_ad_rgb and llvm_ad_rgb.
+    return mi.Float(tensor.detach().cpu().numpy())
+
+
 def sph_to_dir(theta, phi):
     st, ct = dr.sincos(theta)
     sp, cp = dr.sincos(phi)
     return mi.Vector3f(cp * st, sp * st, ct)
+
+
 def cart_to_spher(xyz):
     r = torch.norm(xyz, dim=1)
     theta = torch.acos(xyz[:,2]/(r+1e-8))
@@ -45,12 +77,17 @@ class MyBSDF(mi.BSDF):
         self.albedo = mi.Color3f(props["albedo"])
         self.bsdf = bsdf_materials[self.idx]
         
-        self.D_sample = NN_cond_pos(input_dim=6,output_dim=2,N_NEURONS=32,POSITIONAL_ENCODING_BASIS_NUM=5).to("cuda")
-        self.D_sample.load_state_dict(torch.load(f"checkpoints_new/bsdf_{self.idx}_spherical/brdf_rectify_network{self.idx}.pth"))
+        _script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.D_sample = NN_cond_pos(input_dim=6,output_dim=2,N_NEURONS=32,POSITIONAL_ENCODING_BASIS_NUM=5).to(device)
+        self.D_sample.load_state_dict(torch.load(
+            os.path.join(_script_dir, f"checkpoints_new/bsdf_{self.idx}_spherical/brdf_rectify_network{self.idx}.pth"),
+            map_location=device))
         self.D_sample.eval()
-        
-        self.D_base = NN_cond_pretrain_spherical_one(input_dim=2,N_NEURONS=16).to("cuda")
-        self.D_base.load_state_dict(torch.load(f"checkpoints_new/bsdf_{self.idx}_spherical/brdf_pretrain_network{self.idx}.pth"))
+
+        self.D_base = NN_cond_pretrain_spherical_one(input_dim=2,N_NEURONS=16).to(device)
+        self.D_base.load_state_dict(torch.load(
+            os.path.join(_script_dir, f"checkpoints_new/bsdf_{self.idx}_spherical/brdf_pretrain_network{self.idx}.pth"),
+            map_location=device))
         
         reflection_flags = mi.BSDFFlags.Diffuse | mi.BSDFFlags.FrontSide | mi.BSDFFlags.BackSide
         self.m_components = [reflection_flags]
@@ -62,45 +99,37 @@ class MyBSDF(mi.BSDF):
 
         active &= cos_theta_i > 0
 
-        wi = si.wi.torch()
+        # .torch() returns CPU tensor with llvm_ad_rgb; move to device for network
+        wi = si.wi.torch().to(device)
         wi_input = cart_to_spher(wi)
-        
+
         wo,pdf = network_sampling_spherical(self.D_base,self.D_sample,wi_input,T=8)
         pdf = torch.where(torch.sin(wo[:,0]) > 0.00005, pdf, torch.zeros_like(pdf))
 
-        # print("Time1: ", time1)        
-        wo = mi.Vector2f(wo[...,0], wo[...,1])
+        wo = mi.Vector2f(to_mi_float(wo[...,0]), to_mi_float(wo[...,1]))
         wo = sph_to_dir(wo.x, wo.y)
-        
+
         bs = mi.BSDFSample3f()
-        
-        bs.wo = wo           
-        
+
+        bs.wo = wo
+
         floatmax = mi.Float(np.array([np.finfo(np.float32).max]))
-        
+
         invsin_theta_o =dr.clamp(1/ (dr.abs(mi.Frame3f.sin_theta(bs.wo))) ,1,floatmax)
         if dr.any_nested(invsin_theta_o<0):
             print("invsin_theta_o<0")
-        bs.pdf = mi.Float(pdf) * invsin_theta_o
-        # (bs, value) = self.bsdf.sample(ctx, si, sample1, sample2, active=True)
-        # bs.wo = mi.warp.square_to_cosine_hemisphere(sample2)
-        # bs.pdf = mi.warp.square_to_cosine_hemisphere_pdf(bs.wo)
+        bs.pdf = to_mi_float(pdf) * invsin_theta_o
         bs.sampled_component = 2
         bs.eta = dr.select((mi.Frame3f.cos_theta(bs.wo) > 0.0), 1.0, 1.788)
         bs.sampled_type = dr.select((mi.Frame3f.cos_theta(bs.wo) > 0.0), 8, 16)
-        
-        
-        wi_input = si.wi.torch()[...,:2]
-        wo_tmp = bs.wo.torch()[...,:2]
-        #brdf = self.bsdf.eval(wi_input, wo_tmp)
+
         brdf = self.bsdf.eval(ctx, si, bs.wo)
-        value = brdf * self.albedo / mi.Float(pdf) * mi.Frame3f.sin_theta(bs.wo)
+        value = brdf * self.albedo / to_mi_float(pdf) * mi.Frame3f.sin_theta(bs.wo)
         value = dr.select((bs.pdf > 0.0), value, mi.Vector3f(0))
-        # print("value1: ", value1)
-        pdf = bs.pdf.torch()
-        value_torch = value.torch()[:,0]
+        pdf = bs.pdf.torch().to(device)
+        value_torch = value.torch()[:,0].to(device)
         pdf = torch.where(value_torch<3.5, pdf, torch.zeros_like(pdf))
-        bs.pdf = mi.Float(pdf) 
+        bs.pdf = to_mi_float(pdf)
         return (bs, dr.select((bs.pdf > 0.0) , value, mi.Vector3f(0)))
 
     def eval(self, ctx, si, wo, active=True):
@@ -114,15 +143,15 @@ class MyBSDF(mi.BSDF):
 
     def pdf(self, ctx, si, wo, active=True):
 
-        wi = si.wi.torch()
+        wi = si.wi.torch().to(device)
         wi_input = cart_to_spher(wi)
-        wo = wo.torch()
-        wo_input = cart_to_spher(wo)
-        pdf = network_pdf_spherical(self.D_base,self.D_sample,wo_input,wi_input,T=8) 
+        # Use separate variable to avoid shadowing the Mitsuba Vector3f `wo`
+        wo_torch = wo.torch().to(device)
+        wo_input = cart_to_spher(wo_torch)
+        pdf = network_pdf_spherical(self.D_base,self.D_sample,wo_input,wi_input,T=8)
         floatmax = mi.Float(np.array([np.finfo(np.float32).max]))
-        # pdf = torch.where(torch.sin(wo_input[:,0]) > 0.00005, pdf, torch.zeros_like(pdf))
         invsin_theta_o =dr.clamp(1/ (dr.abs(mi.Frame3f.sin_theta(wo))) ,1,floatmax)
-        pdf = mi.Float(pdf) * invsin_theta_o
+        pdf = to_mi_float(pdf) * invsin_theta_o
         # # pdf = self.bsdf.pdf(ctx, si, wo)
         # value =  self.bsdf.eval(ctx, si, wo) / mi.Float(pdf) 
         # # print("value1: ", value1)
@@ -140,18 +169,22 @@ class MyBSDF(mi.BSDF):
 
 
 if __name__ == "__main__":
-    mi.set_variant("cuda_ad_rgb")
     import time
 
     start_time = time.time()
     mi.register_bsdf("mybsdf", lambda props: MyBSDF(props))
 
-    scene_path = os.path.join("matpreview", parser.scene_file)
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    scene_file = parser.scene_file
+    if not scene_file.lower().endswith(".xml"):
+        scene_file += ".xml"
+    scene_path = os.path.join(_script_dir, "matpreview", scene_file)
+    if not os.path.exists(scene_path):
+        raise FileNotFoundError(f"Scene file does not exist: {scene_path}")
     scene = mi.load_file(scene_path)
 
-    # print(params)
     SPP = 4
-    spp = SPP * 128
+    spp = SPP * parser.passes
 
     seed = 0
     image = mi.render(scene, spp=SPP, seed=seed).numpy()
@@ -160,9 +193,10 @@ if __name__ == "__main__":
         image += mi.render(scene, spp=SPP, seed=seed).numpy()
         seed += 1
     image /= (spp // SPP) + 1
-    
-    # gtfilepath_exr = os.path.join(path, "roughdielectric0.2"+"8196.exr")
-    filepath = os.path.join("diffusion_bsdf_myresult", f"{parser.scene_file}.png")
+
+    output_dir = os.path.join(_script_dir, "diffusion_bsdf_myresult")
+    os.makedirs(output_dir, exist_ok=True)
+    filepath = os.path.join(output_dir, f"{parser.scene_file}.png")
     mi.util.write_bitmap(filepath, image, spp)
-    filepath = os.path.join("diffusion_bsdf_myresult", f"{parser.scene_file}.exr")
+    filepath = os.path.join(output_dir, f"{parser.scene_file}.exr")
     mi.util.write_bitmap(filepath, image, spp)

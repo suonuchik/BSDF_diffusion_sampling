@@ -1,7 +1,9 @@
 import drjit as dr
 import mitsuba as mi
 import torch
-mi.set_variant('cuda_ad_rgb')
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
 import OpenEXR
 import Imath
 import numpy as np
@@ -53,17 +55,17 @@ def cart_to_twodisk(wo):
     return wo[:,0:2]
 def onedisk_to_dr(wi,wo):
     si = dr.zeros(mi.SurfaceInteraction3f)
-    wi = disk_to_cart(wi).cuda().float()
+    wi = disk_to_cart(wi).to(device).float()
     si.wi = mi.Vector3f(wi[...,0], wi[...,1], wi[...,2])
-    wo = disk_to_cart(wo).cuda().float()
+    wo = disk_to_cart(wo).to(device).float()
     wo = mi.Vector3f(wo[...,0], wo[...,1], wo[...,2])
 
     return si,wo
 def twodisk_to_dr(wi,wo):
     si = dr.zeros(mi.SurfaceInteraction3f)
-    wi = twodisk_to_cart(wi).cuda().float()
+    wi = twodisk_to_cart(wi).to(device).float()
     si.wi = mi.Vector3f(wi[...,0], wi[...,1], wi[...,2])
-    wo = twodisk_to_cart(wo).cuda().float()
+    wo = twodisk_to_cart(wo).to(device).float()
     wo = mi.Vector3f(wo[...,0], wo[...,1], wo[...,2])
     return si,wo
 class roughconductor():
