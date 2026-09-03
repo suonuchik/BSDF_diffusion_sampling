@@ -20,21 +20,28 @@ _mi_variant = None
 for _variant in ("cuda_ad_rgb", "llvm_ad_rgb"):
     try:
         mi.set_variant(_variant)
+        # Load a minimal scene with a path integrator to trigger OptiX init check
+        mi.load_dict({
+            "type": "scene",
+            "integrator": {"type": "path"},
+            "sensor": {
+                "type": "perspective",
+                "film": {"type": "hdrfilm", "width": 1, "height": 1},
+                "sampler": {"type": "independent"},
+            },
+        })
         _mi_variant = _variant
         print(f"Mitsuba variant: {_variant}")
         break
     except Exception as _exc:
         print(f"Mitsuba variant {_variant} failed: {_exc}", file=sys.stderr)
 
-# When using llvm_ad_rgb, PyTorch ops inside DrJIT worker threads cause
-# nanothread assertion failures. Force single thread and CPU device to avoid this.
-if _mi_variant == "cuda_ad_rgb" and torch.cuda.is_available():
-    device = torch.device("cuda:0")
-else:
-    device = torch.device("cpu")
-    # Restrict DrJIT LLVM thread pool to 1 so Python callbacks are not called
-    # from multiple threads simultaneously (prevents nanothread assertion).
+# With llvm_ad_rgb, DrJIT's multi-threaded LLVM pool calling PyTorch CUDA from
+# worker threads causes nanothread assertion failures. set_thread_count(1) makes
+# callbacks happen on a single thread, making CUDA PyTorch safe to use.
+if _mi_variant != "cuda_ad_rgb":
     dr.set_thread_count(1)
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # Propagate device choice to mlp_brdf_sampling so its internal tensors match
 import utils.mlp_brdf_sampling as _mlp_mod
