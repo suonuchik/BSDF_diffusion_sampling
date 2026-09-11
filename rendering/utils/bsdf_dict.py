@@ -1,4 +1,5 @@
 import mitsuba as mi
+from utils.mitsuba_brdf_yarn import khungurn_bsdf
 
 bsdf_materials = []
 
@@ -389,6 +390,32 @@ bsdf_materials.append(mi.load_dict(
                 "alpha": 0.5,
                 "int_ior": "bk7",
                 "ext_ior": "air",
-                
+
             }
         ))
+
+# ---- ヤーン繊維素材（Khungurn 2012 パラメータ） idx=26〜30 ----
+bsdf_materials.append(khungurn_bsdf(
+    reflectance=[0.040, 0.087, 0.087], transmittance=[0.452, 0.725, 0.948],
+    r_longwidth_deg=7.238, tt_longwidth_deg=10.000, tt_aziwidth_deg=25.989,
+))  # idx=26: fleece
+
+bsdf_materials.append(khungurn_bsdf(
+    reflectance=[0.185, 0.047, 0.069], transmittance=[0.999, 0.330, 0.354],
+    r_longwidth_deg=2.141, tt_longwidth_deg=10.000, tt_aziwidth_deg=23.548,
+))  # idx=27: gabardine
+
+bsdf_materials.append(khungurn_bsdf(
+    reflectance=[0.745, 0.008, 0.070], transmittance=[0.620, 0.553, 0.562],
+    r_longwidth_deg=1.000, tt_longwidth_deg=10.000, tt_aziwidth_deg=19.823,
+))  # idx=28: silk
+
+bsdf_materials.append(khungurn_bsdf(
+    reflectance=[0.989, 0.959, 0.874], transmittance=[0.999, 0.999, 0.999],
+    r_longwidth_deg=1.000, tt_longwidth_deg=27.197, tt_aziwidth_deg=38.269,
+))  # idx=29: cotton
+
+bsdf_materials.append(khungurn_bsdf(
+    reflectance=[0.700, 0.700, 0.700], transmittance=[0.600, 0.000, 0.800],
+    r_longwidth_deg=5.238, tt_longwidth_deg=10.000, tt_aziwidth_deg=25.000,
+))  # idx=30: polyester

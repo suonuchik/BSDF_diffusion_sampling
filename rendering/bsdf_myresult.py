@@ -58,6 +58,7 @@ parser.add_argument("--passes", type=int, default=128)
 parser = parser.parse_args()
 
 from utils.bsdf_dict import *
+from utils.mitsuba_brdf_yarn import khungurn_bsdf
 
 
 def to_mi_float(tensor):
@@ -65,6 +66,8 @@ def to_mi_float(tensor):
     # Using .cpu().numpy() works for both cuda_ad_rgb and llvm_ad_rgb.
     return mi.Float(tensor.detach().cpu().numpy())
 
+
+# ---- 表面BSDF用の座標変換（法線 = z 軸） ----
 
 def sph_to_dir(theta, phi):
     st, ct = dr.sincos(theta)
@@ -77,6 +80,30 @@ def cart_to_spher(xyz):
     theta = torch.acos(xyz[:,2]/(r+1e-8))
     phi = torch.atan2(xyz[:,1], xyz[:,0])
     return torch.stack([theta, phi], dim=1)
+
+
+# ---- ヤーン繊維BSDF用の座標変換（繊維軸 = x 軸） ----
+# 【表面BSDFとの違い】
+# 表面BSDF: theta = acos(z),  phi = atan2(y, x)  → theta ∈ [0, π]
+# ヤーンBSDF: theta = asin(x), phi = atan2(z, y)  → theta ∈ [-π/2, π/2]
+
+def cart_to_yarn_spher(xyz):
+    """3D直交座標 → ヤーン繊維球面座標 (theta, phi)"""
+    theta = torch.asin(xyz[:,0].clamp(-1 + 1e-6, 1 - 1e-6))  # 縦方向角
+    phi   = torch.atan2(xyz[:,2], xyz[:,1])                    # 方位角
+    return torch.stack([theta, phi], dim=1)
+
+
+def yarn_to_dir_mi(wo_tp):
+    """ヤーン繊維球面座標 (theta, phi) → Mitsuba Vector3f
+    (x, y, z) = (sin(θ), cos(θ)cos(φ), cos(θ)sin(φ))
+    """
+    theta = wo_tp[:, 0]
+    phi   = wo_tp[:, 1]
+    x = torch.sin(theta)
+    y = torch.cos(theta) * torch.cos(phi)
+    z = torch.cos(theta) * torch.sin(phi)
+    return mi.Vector3f(to_mi_float(x), to_mi_float(y), to_mi_float(z))
 class MyBSDF(mi.BSDF):
     def __init__(self, props):
         mi.BSDF.__init__(self, props)
@@ -175,11 +202,163 @@ class MyBSDF(mi.BSDF):
         return "MyBSDF[\n" "    albedo=%s,\n" "]" % (self.albedo)
 
 
+class MyYarnBSDF(mi.BSDF):
+    """拡散サンプリングで学習したヤーン繊維BSDFのMitsuba BSDFプラグイン。
+
+    【MyBSDFとの主な違い】
+
+    1. 座標系: 繊維軸 = x 軸（theta ∈ [-π/2, π/2]）
+       MyBSDF   は法線 = z 軸（theta ∈ [0, π]）
+
+    2. 入射方向の制限なし:
+       MyBSDF   は `active &= cos_theta_i > 0` で上半球のみ許可
+       MyYarnBSDF はどの方向からの入射も処理する（R + TT 両ローブ）
+
+    3. サンプリング重みのヤコビアン:
+       表面BSDF は dω = sin(θ)dθdφ → 重みに sin(θo) を掛ける
+       ヤーンBSDF は dω = cos(θ)dθdφ → khungurn_bsdf.eval が既に cos(θo) を含むため
+                    追加の Jacobian は不要（重みは brdf_yarn / pdf のみ）
+
+    4. チェックポイントフォルダ: checkpoints_new/bsdf_{idx}_yarn/
+    """
+
+    def __init__(self, props):
+        mi.BSDF.__init__(self, props)
+        self.idx = props["idx"]
+        self.albedo = mi.Color3f(props["albedo"])
+        self.bsdf = bsdf_materials[self.idx]  # khungurn_bsdf インスタンス
+
+        _script_dir = os.path.dirname(os.path.abspath(__file__))
+        # ヤーン素材のチェックポイントは _yarn フォルダに保存されている
+        ckpt_dir = os.path.join(_script_dir, f"checkpoints_new/bsdf_{self.idx}_yarn")
+
+        self.D_sample = NN_cond_pos(
+            input_dim=6, output_dim=2, N_NEURONS=32,
+            POSITIONAL_ENCODING_BASIS_NUM=5
+        ).to(device)
+        self.D_sample.load_state_dict(torch.load(
+            os.path.join(ckpt_dir, f"brdf_rectify_network{self.idx}.pth"),
+            map_location=device,
+        ))
+        self.D_sample.eval()
+
+        self.D_base = NN_cond_pretrain_spherical_one(
+            input_dim=2, N_NEURONS=16
+        ).to(device)
+        self.D_base.load_state_dict(torch.load(
+            os.path.join(ckpt_dir, f"brdf_pretrain_network{self.idx}.pth"),
+            map_location=device,
+        ))
+
+        # ヤーン繊維は Glossy かつ両面（反射 + 透過）
+        flags = (mi.BSDFFlags.Glossy | mi.BSDFFlags.FrontSide
+                 | mi.BSDFFlags.BackSide | mi.BSDFFlags.Anisotropic)
+        self.m_components = [flags]
+        self.m_flags = flags
+
+    def sample(self, ctx, si, sample1, sample2, active=True):
+        # ---- 入射方向をヤーン球面座標に変換 ----
+        wi = si.wi.torch().to(device)
+        wi_input = cart_to_yarn_spher(wi)  # (N, 2): (theta_i, phi_i)
+
+        # ---- 学習済みネットワークで出射方向をサンプリング ----
+        wo, pdf = network_sampling_spherical(
+            self.D_base, self.D_sample, wi_input, T=8
+        )
+        # wo: (N, 2): (theta_o, phi_o) in yarn coords
+
+        # cos(θ_fiber) = ヤーン座標の Jacobian（dω = cos(θ)dθdφ）
+        cos_theta_fiber = torch.cos(wo[:, 0]).abs()
+
+        # cos(θ_surface) = サーフェス法線との内積 = z成分 = cos(θ_fiber) × sin(φ_fiber)
+        # yarn_to_dir_mi が返す (x,y,z) = (sin θ, cos θ cos φ, cos θ sin φ) なので z = cos_fiber × sin_phi
+        cos_theta_surface = torch.cos(wo[:, 0]) * torch.sin(wo[:, 1])
+
+        # 有効条件: 極点でなく（Jacobian が 0 でない）かつサーフェス上半球（z > 0）
+        valid = (cos_theta_fiber > 0.00005) & (cos_theta_surface > 0)
+        pdf = torch.where(valid, pdf, torch.zeros_like(pdf))
+
+        # ---- ヤーン球面座標 → Mitsuba 3D 方向 ----
+        bs = mi.BSDFSample3f()
+        bs.wo = yarn_to_dir_mi(wo)
+
+        floatmax = mi.Float(np.array([np.finfo(np.float32).max]))
+        # 立体角 pdf = pdf_θφ / cos_fiber（ヤーン座標 Jacobian）
+        invcos_theta_fiber = dr.clamp(
+            to_mi_float(1.0 / cos_theta_fiber.clamp(min=1e-6)), 1.0, floatmax
+        )
+        bs.pdf = to_mi_float(pdf) * invcos_theta_fiber
+        bs.sampled_component = mi.UInt32(0)
+        bs.eta = mi.Float(1.0)  # ヤーンは屈折なし
+        bs.sampled_type = mi.UInt32(+mi.BSDFFlags.GlossyReflection)
+
+        # ---- サンプリング重みの計算 ----
+        # Mitsuba の path integrator は value = f(wi,wo) × cos_surface / pdf_solid を期待する。
+        # khungurn_bsdf.eval() = (S_R + S_TT) × cos_fiber（= brdf_yarn）なので:
+        #
+        #   value = f × cos_surface / pdf_solid
+        #         = f × cos_surface / (pdf_θφ / cos_fiber)
+        #         = f × cos_fiber × cos_surface / pdf_θφ
+        #         = brdf_yarn × cos_surface / pdf_θφ
+        #
+        # 従来は cos_surface を掛け忘れており、phi ≈ 0,π の方向で value → ∞ に
+        # なって firefly の原因になっていた。
+        cos_surface_pos = cos_theta_surface.clamp(min=0)
+        brdf = self.bsdf.eval(wi_input, wo)  # (N,) PyTorch tensor
+        safe_pdf = pdf.clamp(min=1e-8)
+        value = mi.Color3f(to_mi_float(brdf * cos_surface_pos / safe_pdf)) * self.albedo
+        value = dr.select(bs.pdf > 0.0, value, mi.Color3f(0))
+
+        # 過大な値をクリップ（数値的な外れ値を除去）
+        pdf_torch    = bs.pdf.torch().to(device)
+        value_scalar = value.torch()[:, 0].to(device)
+        pdf_torch = torch.where(value_scalar < 3.5, pdf_torch,
+                                torch.zeros_like(pdf_torch))
+        bs.pdf = to_mi_float(pdf_torch)
+
+        return (bs, dr.select(bs.pdf > 0.0, value, mi.Color3f(0)))
+
+    def eval(self, ctx, si, wo, active=True):
+        # ---- 入出射方向をヤーン球面座標に変換して BSDF 値を評価 ----
+        # Mitsuba の規約: eval() は f(wi,wo) × |cos_surface| を返す。
+        # khungurn.eval() = f × cos_fiber なので、
+        #   f × cos_surface = khungurn.eval() × sin(φ_fiber)
+        # （cos_surface = cos_fiber × sin_phi_fiber = khungurn.eval()/f × sin_phi = ... = brdf_yarn × sin_phi / cos_fiber × cos_fiber = brdf_yarn × sin_phi）
+        # ただし cos_fiber で割ることは数値不安定なため、直接 brdf_yarn × sin_phi で計算。
+        wi_t = cart_to_yarn_spher(si.wi.torch().to(device))
+        wo_t = cart_to_yarn_spher(wo.torch().to(device))
+        brdf_yarn = self.bsdf.eval(wi_t, wo_t)  # f × cos_fiber
+        sin_phi = torch.sin(wo_t[:, 1])          # sin(φ_fiber); cos_surface = cos_fiber × sin_phi
+        brdf_surface = (brdf_yarn * sin_phi).clamp(min=0)  # f × cos_surface
+        return mi.Color3f(to_mi_float(brdf_surface)) * self.albedo
+
+    def pdf(self, ctx, si, wo, active=True):
+        wi_t = cart_to_yarn_spher(si.wi.torch().to(device))
+        wo_t = cart_to_yarn_spher(wo.torch().to(device))
+        pdf = network_pdf_spherical(
+            self.D_base, self.D_sample, wo_t, wi_t, T=8
+        )
+        # (θ,φ) 空間の pdf → 立体角 pdf へ変換
+        cos_theta_o = torch.cos(wo_t[:, 0]).abs().clamp(min=1e-6)
+        floatmax = mi.Float(np.array([np.finfo(np.float32).max]))
+        invcos_theta_o = dr.clamp(
+            to_mi_float(1.0 / cos_theta_o), 1.0, floatmax
+        )
+        return to_mi_float(pdf) * invcos_theta_o
+
+    def eval_pdf(self, ctx, si, wo, active=True):
+        return self.eval(ctx, si, wo, active), self.pdf(ctx, si, wo, active)
+
+    def to_string(self):
+        return "MyYarnBSDF[\n" "    albedo=%s,\n" "]" % (self.albedo)
+
+
 if __name__ == "__main__":
     import time
 
     start_time = time.time()
-    mi.register_bsdf("mybsdf", lambda props: MyBSDF(props))
+    mi.register_bsdf("mybsdf",     lambda props: MyBSDF(props))
+    mi.register_bsdf("myyarnbsdf", lambda props: MyYarnBSDF(props))
 
     _script_dir = os.path.dirname(os.path.abspath(__file__))
     scene_file = parser.scene_file
