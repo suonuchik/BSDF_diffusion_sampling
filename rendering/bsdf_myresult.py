@@ -229,8 +229,9 @@ class MyYarnBSDF(mi.BSDF):
         self.bsdf = bsdf_materials[self.idx]  # khungurn_bsdf インスタンス
 
         _script_dir = os.path.dirname(os.path.abspath(__file__))
-        # ヤーン素材のチェックポイントは _yarn フォルダに保存されている
-        ckpt_dir = os.path.join(_script_dir, f"checkpoints_new/bsdf_{self.idx}_yarn")
+        # ヤーン素材のチェックポイントは learning_repo_cleanup 側に保存されている
+        ckpt_dir = os.path.join(_script_dir, "..", "learning_repo_cleanup",
+                                "checkpoints_new", f"bsdf_{self.idx}_yarn")
 
         self.D_sample = NN_cond_pos(
             input_dim=6, output_dim=2, N_NEURONS=32,
