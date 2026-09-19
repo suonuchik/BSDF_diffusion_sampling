@@ -1,0 +1,79 @@
+<scene version="3.0.0">
+    <default name="spp" value="64"/>
+    <default name="width" value="512"/>
+    <default name="height" value="512"/>
+    <default name="max_depth" value="-1"/>
+
+    <integrator type="path">
+        <integer name="max_depth" value="$max_depth"/>
+    </integrator>
+
+    <!-- cotton plane シーンと同一のカメラ・照明設定 -->
+    <sensor type="perspective" id="camera">
+        <string name="fov_axis" value="smaller" />
+        <float name="fov" value="45.0" />
+        <transform name="to_world">
+            <lookat target="0, 0, 0"
+                    origin="0, -3, 2"
+                    up="0, 0, 1" />
+        </transform>
+        <sampler type="independent">
+            <integer name="sample_count" value="$spp" />
+        </sampler>
+        <film type="hdrfilm" id="film">
+            <integer name="width" value="$width" />
+            <integer name="height" value="$height" />
+            <string name="pixel_format" value="rgb" />
+            <rfilter type="gaussian" />
+        </film>
+    </sensor>
+
+    <emitter type="envmap" id="emitter-envmap">
+        <string name="filename" value="envmap.exr" />
+        <transform name="to_world">
+            <rotate y="1" angle="-180" />
+            <matrix value="-0.224951 -0.000001 -0.974370 0.000000 -0.974370 0.000000 0.224951 0.000000 0.000000 1.000000 -0.000001 8.870000 0.000000 0.000000 0.000000 1.000000" />
+        </transform>
+        <float name="scale" value="1.5" />
+    </emitter>
+
+    <shape type="rectangle" id="shape-backlight">
+        <transform name="to_world">
+            <scale x="1.5" y="1.5"/>
+            <rotate x="1" angle="180"/>
+            <translate z="-0.8"/>
+        </transform>
+        <emitter type="area">
+            <rgb name="radiance" value="8.0, 7.5, 7.0"/>
+        </emitter>
+    </shape>
+
+    <!--
+        idx=12: metallic=0.8, roughness=0.1 の光沢金属系 principled BSDF
+        MyBSDF（等方性）を使用 → cotton plane との比較用
+    -->
+    <bsdf type="mybsdf" id="bsdf-metal">
+        <integer name="idx" value="12"/>
+        <vector name="albedo" value="1.0, 0.8, 0.6"/>
+    </bsdf>
+
+    <bsdf type="diffuse" id="bsdf-floor">
+        <rgb name="reflectance" value="0.3 0.3 0.3" />
+    </bsdf>
+
+    <shape type="rectangle" id="shape-plate">
+        <transform name="to_world">
+            <scale x="1.5" y="1.5"/>
+        </transform>
+        <ref name="bsdf" id="bsdf-metal"/>
+    </shape>
+
+    <shape type="rectangle" id="shape-floor">
+        <transform name="to_world">
+            <scale x="5" y="5"/>
+            <translate z="-0.05"/>
+        </transform>
+        <ref name="bsdf" id="bsdf-floor"/>
+    </shape>
+
+</scene>

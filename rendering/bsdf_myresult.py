@@ -251,11 +251,13 @@ class MyYarnBSDF(mi.BSDF):
             map_location=device,
         ))
 
-        # ヤーン繊維は Glossy かつ両面（反射 + 透過）
-        flags = (mi.BSDFFlags.Glossy | mi.BSDFFlags.FrontSide
-                 | mi.BSDFFlags.BackSide | mi.BSDFFlags.Anisotropic)
-        self.m_components = [flags]
-        self.m_flags = flags
+        # ヤーン繊維は Glossy かつ両面（反射 R + 透過 TT 両ローブ）
+        refl_flags  = (mi.BSDFFlags.GlossyReflection  | mi.BSDFFlags.FrontSide
+                       | mi.BSDFFlags.BackSide | mi.BSDFFlags.Anisotropic)
+        trans_flags = (mi.BSDFFlags.GlossyTransmission | mi.BSDFFlags.FrontSide
+                       | mi.BSDFFlags.BackSide | mi.BSDFFlags.Anisotropic)
+        self.m_components = [refl_flags, trans_flags]
+        self.m_flags = refl_flags | trans_flags
 
     def sample(self, ctx, si, sample1, sample2, active=True):
         # ---- 入射方向をヤーン球面座標に変換 ----
@@ -275,8 +277,9 @@ class MyYarnBSDF(mi.BSDF):
         # yarn_to_dir_mi が返す (x,y,z) = (sin θ, cos θ cos φ, cos θ sin φ) なので z = cos_fiber × sin_phi
         cos_theta_surface = torch.cos(wo[:, 0]) * torch.sin(wo[:, 1])
 
-        # 有効条件: 極点でなく（Jacobian が 0 でない）かつサーフェス上半球（z > 0）
-        valid = (cos_theta_fiber > 0.00005) & (cos_theta_surface > 0)
+        # 有効条件: 極点でなく（Jacobian が 0 でない）
+        # TT 方向（cos_theta_surface < 0）も許可して透過ローブを有効化
+        valid = cos_theta_fiber > 0.00005
         pdf = torch.where(valid, pdf, torch.zeros_like(pdf))
 
         # ---- ヤーン球面座標 → Mitsuba 3D 方向 ----
@@ -290,24 +293,22 @@ class MyYarnBSDF(mi.BSDF):
         )
         bs.pdf = to_mi_float(pdf) * invcos_theta_fiber
         bs.sampled_component = mi.UInt32(0)
-        bs.eta = mi.Float(1.0)  # ヤーンは屈折なし
-        bs.sampled_type = mi.UInt32(+mi.BSDFFlags.GlossyReflection)
+        bs.eta = mi.Float(1.0)  # ヤーンは屈折なし（透過も eta=1）
+        # R か TT かを cos_surface の符号で判定
+        is_refl = to_mi_float((cos_theta_surface > 0).float()) > 0.5
+        bs.sampled_type = dr.select(
+            is_refl,
+            mi.UInt32(+mi.BSDFFlags.GlossyReflection),
+            mi.UInt32(+mi.BSDFFlags.GlossyTransmission),
+        )
 
         # ---- サンプリング重みの計算 ----
-        # Mitsuba の path integrator は value = f(wi,wo) × cos_surface / pdf_solid を期待する。
-        # khungurn_bsdf.eval() = (S_R + S_TT) × cos_fiber（= brdf_yarn）なので:
-        #
-        #   value = f × cos_surface / pdf_solid
-        #         = f × cos_surface / (pdf_θφ / cos_fiber)
-        #         = f × cos_fiber × cos_surface / pdf_θφ
-        #         = brdf_yarn × cos_surface / pdf_θφ
-        #
-        # 従来は cos_surface を掛け忘れており、phi ≈ 0,π の方向で value → ∞ に
-        # なって firefly の原因になっていた。
-        cos_surface_pos = cos_theta_surface.clamp(min=0)
+        # value = brdf_yarn × |cos_surface| / pdf_θφ
+        # TT 方向も |cos_surface| で正の重みを持つ
+        cos_surface_abs = cos_theta_surface.abs()
         brdf = self.bsdf.eval(wi_input, wo)  # (N,) PyTorch tensor
         safe_pdf = pdf.clamp(min=1e-8)
-        value = mi.Color3f(to_mi_float(brdf * cos_surface_pos / safe_pdf)) * self.albedo
+        value = mi.Color3f(to_mi_float(brdf * cos_surface_abs / safe_pdf)) * self.albedo
         value = dr.select(bs.pdf > 0.0, value, mi.Color3f(0))
 
         # 過大な値をクリップ（数値的な外れ値を除去）
@@ -329,9 +330,10 @@ class MyYarnBSDF(mi.BSDF):
         wi_t = cart_to_yarn_spher(si.wi.torch().to(device))
         wo_t = cart_to_yarn_spher(wo.torch().to(device))
         brdf_yarn = self.bsdf.eval(wi_t, wo_t)  # f × cos_fiber
-        sin_phi = torch.sin(wo_t[:, 1])          # sin(φ_fiber); cos_surface = cos_fiber × sin_phi
-        brdf_surface = (brdf_yarn * sin_phi).clamp(min=0)  # f × cos_surface
-        return mi.Color3f(to_mi_float(brdf_surface)) * self.albedo
+        # |cos_surface| = cos_fiber × |sin(φ)|
+        # R 方向（sin_phi > 0）も TT 方向（sin_phi < 0）も abs で正値を返す
+        abs_cos_surface = brdf_yarn * torch.sin(wo_t[:, 1]).abs()
+        return mi.Color3f(to_mi_float(abs_cos_surface)) * self.albedo
 
     def pdf(self, ctx, si, wo, active=True):
         wi_t = cart_to_yarn_spher(si.wi.torch().to(device))
