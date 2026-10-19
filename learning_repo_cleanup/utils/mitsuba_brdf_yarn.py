@@ -87,7 +87,7 @@ def _G_integral(theta, mean, std):
     縦方向ローブ M(θ) は以下で定義される:
         M(θ; mean, std) = N(θ; mean, std) / G(mean, std)
     分母 G は cos²(θ) で重み付けした正規化定数であり、数値積分を避けるため
-    cos²(θ) を 8 次多項式で近似して解析的に積分する（Khungurn 2012 付録）。
+    cos²(θ) を 8 次多項式で近似して解析的に積分する。
 
     多項式近似: cos²(θ) ≈ Σ p[k] θ^k
     係数 p[0..8] は Khungurn 論文付録の値をそのまま使用。
@@ -171,6 +171,12 @@ class khungurn_bsdf:
         self.c_r  = lum(reflectance)
         self.c_tt = lum(transmittance)
 
+        # レンダリング用に RGB も保持する（eval_rgb で使用）
+        # 学習（MCMC の目標密度）は輝度 eval() のままでよいが、
+        # レンダリングで輝度を使うと色が失われ、物理ベースの結果と一致しない
+        self.c_r_rgb  = list(reflectance)
+        self.c_tt_rgb = list(transmittance)
+
         # 度数 → ラジアン変換
         self.r_longwidth  = math.radians(r_longwidth_deg)
         self.tt_longwidth = math.radians(tt_longwidth_deg)
@@ -196,14 +202,31 @@ class khungurn_bsdf:
         -------
         (N,) Tensor  BSDF 輝度値 × cos(theta_o)
         """
-        theta_i = wi[:, 0]
-        phi_i   = wi[:, 1]
-        theta_o = wo[:, 0]
-        phi_o   = wo[:, 1]
+        return self._eval(wi, wo, self.c_r, self.c_tt)
+
+    def eval_rgb(self, wi, wo):
+        """eval() の RGB 版。BSDF × cos(theta_o) を (N, 3) で返す。
+
+        eval() は反射色・透過色を輝度に潰しているため、そのまま
+        レンダリングに使うと灰色の BSDF になる。レンダリングではこちらを使う。
+        """
+        c_r  = torch.tensor(self.c_r_rgb,  dtype=wi.dtype, device=wi.device)
+        c_tt = torch.tensor(self.c_tt_rgb, dtype=wi.dtype, device=wi.device)
+        return self._eval(wi.unsqueeze(1), wo.unsqueeze(1), c_r, c_tt)
+
+    def _eval(self, wi, wo, c_r, c_tt):
+        """eval / eval_rgb の共通実装。
+        輝度版: wi, wo は (N, 2)、c_r, c_tt はスカラー → (N,)
+        RGB 版: wi, wo は (N, 1, 2)、c_r, c_tt は (3,) → (N, 3)
+        """
+        theta_i = wi[..., 0]
+        phi_i   = wi[..., 1]
+        theta_o = wo[..., 0]
+        phi_o   = wo[..., 1]
 
         # ---- Fresnel 反射率（Schlick 近似） ----
         # F_R が大きいほど R ローブが強く、TT ローブが弱くなる
-        F_R = self.c_r + (1.0 - self.c_r) \
+        F_R = c_r + (1.0 - c_r) \
               * (1.0 - torch.abs(torch.cos(theta_i))) ** 5
 
         # ---- R ローブ（鏡面反射成分） ----
@@ -220,6 +243,6 @@ class khungurn_bsdf:
         phi_tt = _regularize(phi_i + math.pi)   # TT の基準方位角（真正面）
         phi_d  = _regularize(phi_o - phi_tt)    # 基準からのずれ
         N_TT  = _uct_gaussian_pdf(phi_d, 0.0, self.tt_aziwidth, -math.pi, math.pi)
-        S_TT  = (1.0 - F_R) * self.c_tt * M_TT * N_TT
+        S_TT  = (1.0 - F_R) * c_tt * M_TT * N_TT
 
         return (S_R + S_TT) * torch.cos(theta_o)

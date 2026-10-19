@@ -13,7 +13,7 @@ def yarn_to_cart(theta_phi):
     表面BSDF（mitsuba_brdf_scalar.py の spher_to_cart）は法線を z 軸に取る:
       x = sin(θ)cos(φ), y = sin(θ)sin(φ), z = cos(θ)   θ ∈ [0, π]
 
-    ヤーンBSDF（Khungurn 2012）は繊維軸を x 軸に取る:
+    ヤーンBSDF（Khungurn et al. 2015）は繊維軸を x 軸に取る:
       x = sin(θ)                  ← 繊維軸方向の成分
       y = cos(θ)cos(φ)
       z = cos(θ)sin(φ)            θ ∈ [-π/2, π/2]
@@ -56,8 +56,8 @@ def _gaussian_integral(a, b):
     """標準正規分布の [a, b] 上の積分 Φ(b) - Φ(a)
 
     【なぜ mu, sigma を引数に取らないか】
-    Khungurn 論文の実装では gaussian_cdf が mu, sigma を無視して
-    標準正規 CDF を返す実装になっている。ここではその挙動を忠実に再現する。
+    移植元の neuralyarn の bsdf/khungurn.py では gaussian_cdf が mu, sigma を
+    無視して標準正規 CDF を返す実装になっている。ここではその挙動を忠実に再現する。
     （a, b が [-π, π] のとき Φ(π)-Φ(-π) ≈ 1.0 なので uniform_weight ≈ 0 になる）
     """
     a_t = torch.tensor(a, dtype=torch.float32)
@@ -81,21 +81,29 @@ def _uct_gaussian_pdf(x, mu, sigma, a, b):
 # ---------------------------------------------------------------------------
 
 def _G_integral(theta, mean, std):
-    """cos²(θ) × N(θ; mean, std) の不定積分を解析的に計算する。
+    """cos²(θ) × N(θ; mean, std) の不定積分（cos² を多項式近似したもの）を解析的に計算する。
 
     【なぜ解析積分が必要か】
     縦方向ローブ M(θ) は以下で定義される:
         M(θ; mean, std) = N(θ; mean, std) / G(mean, std)
     分母 G は cos²(θ) で重み付けした正規化定数であり、数値積分を避けるため
-    cos²(θ) を 8 次多項式で近似して解析的に積分する（Khungurn 2012 付録）。
+    cos²(θ) を 8 次多項式で近似して解析的に積分する。
 
     多項式近似: cos²(θ) ≈ Σ p[k] θ^k
-    係数 p[0..8] は Khungurn 論文付録の値をそのまま使用。
+    係数 p[0..8] は neuralyarn の bsdf/khungurn.py と同じ値。テイラー展開ではなく
+    [-π/2, π/2] 全体に合わせた係数で、θ = ±π/2 でもほぼ 0 になる。
+
+    【積分の求め方】
+    P(θ) = A + (θ - mean)·B(θ) - std²·B'(θ) を満たす定数 A と 7 次多項式 B を
+    求めると、N'(θ) = -(θ - mean)/std² · N(θ) より
+        ∫ P(θ) N(θ) dθ = (A/2)·erf((θ - mean)/(√2·std)) - std²·B(θ)·N(θ)
+    となる。
     """
     std2 = std ** 2
     p = [1.0001, 0.0, -0.999745, 0.0, 0.3322, 0.0, -0.04301, 0.0, 0.002439]
 
-    # Horner 法の変形による後退代入（多項式 × ガウスの積分に必要な係数計算）
+    # 両辺の θ^(k+1) の係数を比べて、B の係数 b[k] を高次から順に求める
+    #   b[k] = p[k+1] + mean·b[k+1] + (k+2)·std²·b[k+2]
     b = [0.0] * 9
     b[7] = p[8]
     b[6] = p[7] + mean * b[7]
@@ -103,7 +111,7 @@ def _G_integral(theta, mean, std):
         b[j] = p[j + 1] + mean * b[j + 1] + (j + 2) * std2 * b[j + 2]
 
     B = sum(b[k] * theta ** k for k in range(8))
-    A = p[0] + mean * b[0] + std2 * b[1]
+    A = p[0] + mean * b[0] + std2 * b[1]   # 定数項の比較: p[0] = A - mean·b[0] - std²·b[1]
 
     return (A / 2.0) * torch.erf((theta - mean) / (math.sqrt(2.0) * std)) \
            - std2 * B * _gaussian_pdf(theta, mean, std)
@@ -118,8 +126,11 @@ def _G(mean, std):
 def _cos2_normalized_gaussian(theta, mean, std):
     """縦方向散乱ローブ M(θ; mean, std) = N(θ; mean, std) / G(mean, std)
 
-    cos²(θ) による重み付きガウス分布。繊維BSDFの縦方向散乱の形状を決める。
-    G で割って正規化することで BSDF の energy conservation を保つ。
+    分子は通常のガウスで、cos² は掛かっていない。G で割ることで
+        ∫_{-π/2}^{π/2} M(θ) cos²(θ) dθ = 1
+    となるように正規化されている。eval が掛ける cos(θ_o) と立体角要素
+    dω = cos(θ)dθdφ の cos(θ) を合わせると cos² になるため、この正規化で
+    ∫ eval dω = F_R + (1 - F_R)·c_tt ≤ 1（エネルギー保存）が成り立つ。
     """
     g = _G(mean, std).clamp(min=1e-8)
     return _gaussian_pdf(theta, mean, std) / g
@@ -130,7 +141,7 @@ def _cos2_normalized_gaussian(theta, mean, std):
 # ---------------------------------------------------------------------------
 
 class khungurn_bsdf:
-    """ヤーン繊維BSDF（Khungurn et al. 2012）の純 PyTorch 実装。
+    """ヤーン繊維BSDF（Khungurn et al. 2015）の純 PyTorch 実装。
 
     【物理的なモデル】
     繊維への光の散乱は主に 2 つのローブで構成される:
@@ -171,6 +182,12 @@ class khungurn_bsdf:
         self.c_r  = lum(reflectance)
         self.c_tt = lum(transmittance)
 
+        # レンダリング用に RGB も保持する（eval_rgb で使用）
+        # 学習（MCMC の目標密度）は輝度 eval() のままでよいが、
+        # レンダリングで輝度を使うと色が失われ、物理ベースの結果と一致しない
+        self.c_r_rgb  = list(reflectance)
+        self.c_tt_rgb = list(transmittance)
+
         # 度数 → ラジアン変換
         self.r_longwidth  = math.radians(r_longwidth_deg)
         self.tt_longwidth = math.radians(tt_longwidth_deg)
@@ -180,12 +197,14 @@ class khungurn_bsdf:
         """BSDF × cos(theta_o) を返す。
 
         【なぜ cos(theta_o) が掛かっているか】
-        ヤーン繊維座標では立体角要素が dω = cos(θ)dθdφ となる（表面座標の
-        sin(θ)dθdφ とは異なる）。MCMCの目標密度として直接使用するため、
-        この Jacobian を含んだ形で返している。
+        移植元の neuralyarn の Khungurn.eval() が value = (S_R + S_TT) * cos(theta_o)
+        を返しており、それをそのまま再現している。移植元では Mitsuba の BSDF 規約
+        （eval は f × cos を返す）の cos 項として扱われている。M の cos² 正規化は
+        この cos(θ_o) と立体角要素 dω = cos(θ)dθdφ の cos(θ) を合わせた形になっている。
 
-        【Khungurn 論文の eval との対応】
-            value = (S_R + S_TT) * cos(theta_o)  [原著論文 eq.の実装]
+        なお、ヤーン繊維座標の立体角要素 dω = cos(θ)dθdφ（表面座標の sin(θ)dθdφ
+        とは異なる）の Jacobian も cos(θ) なので、本リポジトリでは eval を
+        (θ, φ) 空間での MCMC の目標密度として直接使用している。
 
         Parameters
         ----------
@@ -196,19 +215,37 @@ class khungurn_bsdf:
         -------
         (N,) Tensor  BSDF 輝度値 × cos(theta_o)
         """
-        theta_i = wi[:, 0]
-        phi_i   = wi[:, 1]
-        theta_o = wo[:, 0]
-        phi_o   = wo[:, 1]
+        return self._eval(wi, wo, self.c_r, self.c_tt)
+
+    def eval_rgb(self, wi, wo):
+        """eval() の RGB 版。BSDF × cos(theta_o) を (N, 3) で返す。
+
+        eval() は反射色・透過色を輝度に潰しているため、そのまま
+        レンダリングに使うと灰色の BSDF になる。レンダリングではこちらを使う。
+        """
+        c_r  = torch.tensor(self.c_r_rgb,  dtype=wi.dtype, device=wi.device)
+        c_tt = torch.tensor(self.c_tt_rgb, dtype=wi.dtype, device=wi.device)
+        return self._eval(wi.unsqueeze(1), wo.unsqueeze(1), c_r, c_tt)
+
+    def _eval(self, wi, wo, c_r, c_tt):
+        """eval / eval_rgb の共通実装。
+        輝度版: wi, wo は (N, 2)、c_r, c_tt はスカラー → (N,)
+        RGB 版: wi, wo は (N, 1, 2)、c_r, c_tt は (3,) → (N, 3)
+        """
+        theta_i = wi[..., 0]
+        phi_i   = wi[..., 1]
+        theta_o = wo[..., 0]
+        phi_o   = wo[..., 1]
 
         # ---- Fresnel 反射率（Schlick 近似） ----
         # F_R が大きいほど R ローブが強く、TT ローブが弱くなる
-        F_R = self.c_r + (1.0 - self.c_r) \
+        F_R = c_r + (1.0 - c_r) \
               * (1.0 - torch.abs(torch.cos(theta_i))) ** 5
 
         # ---- R ローブ（鏡面反射成分） ----
         # 縦方向: -theta_i を中心としたガウス（入射と対称な角度に散乱）
-        # 方位角: 一様分布（鏡面反射は方位角依存なし）
+        # 方位角: 一様分布（Khungurn モデルの簡略化。実際の円柱での鏡面反射は
+        #         方位角に依存するが、全方位に広く散らばるため一様で近似している）
         M_R = _cos2_normalized_gaussian(theta_o, -theta_i, self.r_longwidth)
         N_R = 1.0 / (2.0 * math.pi)
         S_R = F_R * M_R * N_R
@@ -220,6 +257,6 @@ class khungurn_bsdf:
         phi_tt = _regularize(phi_i + math.pi)   # TT の基準方位角（真正面）
         phi_d  = _regularize(phi_o - phi_tt)    # 基準からのずれ
         N_TT  = _uct_gaussian_pdf(phi_d, 0.0, self.tt_aziwidth, -math.pi, math.pi)
-        S_TT  = (1.0 - F_R) * self.c_tt * M_TT * N_TT
+        S_TT  = (1.0 - F_R) * c_tt * M_TT * N_TT
 
         return (S_R + S_TT) * torch.cos(theta_o)

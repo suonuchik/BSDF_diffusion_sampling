@@ -67,6 +67,12 @@ def to_mi_float(tensor):
     return mi.Float(tensor.detach().cpu().numpy())
 
 
+def to_mi_color(tensor):
+    """(N, 3) PyTorch tensor → mi.Color3f"""
+    t = tensor.t().contiguous()  # (3, N): mi.Float には連続メモリを渡す
+    return mi.Color3f(to_mi_float(t[0]), to_mi_float(t[1]), to_mi_float(t[2]))
+
+
 # ---- 表面BSDF用の座標変換（法線 = z 軸） ----
 
 def sph_to_dir(theta, phi):
@@ -94,23 +100,62 @@ def cart_to_yarn_spher(xyz):
     return torch.stack([theta, phi], dim=1)
 
 
-def yarn_to_dir_mi(wo_tp):
-    """ヤーン繊維球面座標 (theta, phi) → Mitsuba Vector3f
+def yarn_spher_to_cart(wo_tp):
+    """ヤーン繊維球面座標 (theta, phi) → 3D直交座標 (N, 3)
     (x, y, z) = (sin(θ), cos(θ)cos(φ), cos(θ)sin(φ))
     """
     theta = wo_tp[:, 0]
     phi   = wo_tp[:, 1]
-    x = torch.sin(theta)
-    y = torch.cos(theta) * torch.cos(phi)
-    z = torch.cos(theta) * torch.sin(phi)
-    return mi.Vector3f(to_mi_float(x), to_mi_float(y), to_mi_float(z))
+    return torch.stack([torch.sin(theta),
+                        torch.cos(theta) * torch.cos(phi),
+                        torch.cos(theta) * torch.sin(phi)], dim=1)
+
+
+def to_mi_vector(tensor):
+    """(N, 3) PyTorch tensor → mi.Vector3f"""
+    t = tensor.t().contiguous()
+    return mi.Vector3f(to_mi_float(t[0]), to_mi_float(t[1]), to_mi_float(t[2]))
+
+
+def attach_curve_frames(scene):
+    """linearcurve 上の MyYarnBSDF に、線分ごとの繊維接線（ワールド座標）を設定する。
+
+    【なぜ必要か】
+    Khungurn BSDF はローカル座標の x 軸 = 繊維接線を前提とする。
+    neuralyarn は Mitsuba の linearcurve.cpp をパッチして sh_frame.s = 接線にしているが、
+    pip 版 Mitsuba は曲線で dp_du を設定しないため、sh_frame.s が法線 n から
+    適当に作られた（繊維とは無関係な）軸になる。
+    そこで線分の接線を BSDF に渡し、BSDF 内でパッチ版と同じヤーン座標系を再構成する。
+
+    シーン読み込み後、レンダリング前に呼ぶこと。曲線以外の形状には何もしない。
+    """
+    seen = {}
+    for shape in scene.shapes():
+        bsdf = shape.bsdf()
+        if not isinstance(bsdf, MyYarnBSDF):
+            continue
+        params = mi.traverse(shape)
+        if "segment_indices" not in params:
+            continue  # 曲線以外（球など）は sh_frame をそのまま使う
+        if id(bsdf) in seen:
+            raise RuntimeError("1つの MyYarnBSDF が複数の曲線形状で共有されています。"
+                               "prim_index が曖昧になるため、形状ごとに BSDF を分けてください。")
+        seen[id(bsdf)] = True
+        cp  = torch.from_numpy(np.array(params["control_points"])).reshape(-1, 4)[:, :3]
+        idx = torch.from_numpy(np.array(params["segment_indices"]).astype(np.int64))
+        tangents = torch.nn.functional.normalize(cp[idx + 1] - cp[idx], dim=1)
+        bsdf.set_segment_tangents(tangents)
+        print(f"attach_curve_frames: {tangents.shape[0]} segments -> {bsdf.to_string().splitlines()[0]}")
 class MyBSDF(mi.BSDF):
     def __init__(self, props):
         mi.BSDF.__init__(self, props)
         self.idx = props["idx"]
         self.albedo = mi.Color3f(props["albedo"])
         self.bsdf = bsdf_materials[self.idx]
-        
+        # 透過側の相対屈折率。素材側は principled が既定の 1.5、roughdielectric(idx=23〜25) が bk7 ≒ 1.50。
+        # bs.eta としてパス積分器のロシアンルーレットにだけ使われ、BSDF の値は変えない
+        self.ior = props.get("ior", 1.5)
+
         _script_dir = os.path.dirname(os.path.abspath(__file__))
         self.D_sample = NN_cond_pos(input_dim=6,output_dim=2,N_NEURONS=32,POSITIONAL_ENCODING_BASIS_NUM=5).to(device)
         self.D_sample.load_state_dict(torch.load(
@@ -123,9 +168,11 @@ class MyBSDF(mi.BSDF):
             os.path.join(_script_dir, f"checkpoints_new/bsdf_{self.idx}_spherical/brdf_pretrain_network{self.idx}.pth"),
             map_location=device))
         
-        reflection_flags = mi.BSDFFlags.Diffuse | mi.BSDFFlags.FrontSide | mi.BSDFFlags.BackSide
-        self.m_components = [reflection_flags]
-        self.m_flags = reflection_flags
+        # 反射と透過（半透明素材）の両方を出力し、どちらの面からの入射も扱う
+        refl_flags  = mi.BSDFFlags.GlossyReflection   | mi.BSDFFlags.FrontSide | mi.BSDFFlags.BackSide
+        trans_flags = mi.BSDFFlags.GlossyTransmission | mi.BSDFFlags.FrontSide | mi.BSDFFlags.BackSide
+        self.m_components = [refl_flags, trans_flags]
+        self.m_flags = refl_flags | trans_flags
 
     def sample(self, ctx, si, sample1, sample2, active=True):
 
@@ -153,9 +200,15 @@ class MyBSDF(mi.BSDF):
         if dr.any_nested(invsin_theta_o<0):
             print("invsin_theta_o<0")
         bs.pdf = to_mi_float(pdf) * invsin_theta_o
-        bs.sampled_component = 2
-        bs.eta = dr.select((mi.Frame3f.cos_theta(bs.wo) > 0.0), 1.0, 1.788)
-        bs.sampled_type = dr.select((mi.Frame3f.cos_theta(bs.wo) > 0.0), 8, 16)
+        # 入射側と出射側で z の符号が逆なら透過。裏側（物体の内側）から入射した場合も正しく判定できる
+        transmit = (cos_theta_i * mi.Frame3f.cos_theta(bs.wo)) < 0.0
+        bs.sampled_component = dr.select(transmit, mi.UInt32(1), mi.UInt32(0))
+        bs.eta = dr.select(transmit, dr.select(cos_theta_i > 0.0, self.ior, 1.0 / self.ior), 1.0)
+        bs.sampled_type = dr.select(
+            transmit,
+            mi.UInt32(+mi.BSDFFlags.GlossyTransmission),
+            mi.UInt32(+mi.BSDFFlags.GlossyReflection),
+        )
 
         brdf = self.bsdf.eval(ctx, si, bs.wo)
         value = brdf * self.albedo / to_mi_float(pdf) * mi.Frame3f.sin_theta(bs.wo)
@@ -199,7 +252,7 @@ class MyBSDF(mi.BSDF):
         return self.eval(ctx, si, wo, active), self.pdf(ctx, si, wo, active)
 
     def to_string(self):
-        return "MyBSDF[\n" "    albedo=%s,\n" "]" % (self.albedo)
+        return "MyBSDF[\n" "    albedo=%s,\n" "    ior=%.4f,\n" "]" % (self.albedo, self.ior)
 
 
 class MyYarnBSDF(mi.BSDF):
@@ -228,10 +281,15 @@ class MyYarnBSDF(mi.BSDF):
         self.albedo = mi.Color3f(props["albedo"])
         self.bsdf = bsdf_materials[self.idx]  # khungurn_bsdf インスタンス
 
+        # ckpt_tag: チェックポイントフォルダの末尾タグ（デフォルト "yarn"）
+        # 例: ckpt_tag="yarn"       → checkpoints_new/bsdf_26_yarn/
+        #     ckpt_tag="yarn_curve" → checkpoints_new/bsdf_26_yarn_curve/
+        ckpt_tag = props.get("ckpt_tag", "yarn")
+
         _script_dir = os.path.dirname(os.path.abspath(__file__))
         # ヤーン素材のチェックポイントは learning_repo_cleanup 側に保存されている
         ckpt_dir = os.path.join(_script_dir, "..", "learning_repo_cleanup",
-                                "checkpoints_new", f"bsdf_{self.idx}_yarn")
+                                "checkpoints_new", f"bsdf_{self.idx}_{ckpt_tag}")
 
         self.D_sample = NN_cond_pos(
             input_dim=6, output_dim=2, N_NEURONS=32,
@@ -259,9 +317,53 @@ class MyYarnBSDF(mi.BSDF):
         self.m_components = [refl_flags, trans_flags]
         self.m_flags = refl_flags | trans_flags
 
+        # 線分ごとの繊維接線（ワールド座標）。attach_curve_frames() で設定される。
+        # None の場合は sh_frame.s を繊維軸とみなす（球などの非曲線形状用）
+        self.seg_tangents = None
+
+    def set_segment_tangents(self, tangents):
+        self.seg_tangents = tangents.to(device, dtype=torch.float32)
+
+    def _yarn_rotation(self, si):
+        """シェーディングフレーム → ヤーン座標の z 軸まわり回転 (cos ψ, sin ψ) を返す。
+
+        ヤーン座標: x = 接線を法線に垂直な面へ射影したもの, y = n × x, z = n
+        （パッチ版 Mitsuba の initialize_sh_frame() と同じ定義）
+        seg_tangents が無い場合は None（回転なし）。
+        """
+        if self.seg_tangents is None:
+            return None
+        prim = torch.from_numpy(np.array(si.prim_index).astype(np.int64)).to(device)
+        # 無効レーンの prim_index は不定値になりうるので範囲内に収める
+        prim = prim.clamp(0, self.seg_tangents.shape[0] - 1)
+        t_world = self.seg_tangents[prim]
+        frame = [si.sh_frame.s.torch().to(device), si.sh_frame.t.torch().to(device)]
+        tx = (t_world * frame[0]).sum(1)
+        ty = (t_world * frame[1]).sum(1)
+        norm = torch.sqrt(tx * tx + ty * ty)
+        ok = norm > 1e-6
+        c = torch.where(ok, tx / norm.clamp(min=1e-6), torch.ones_like(tx))
+        s = torch.where(ok, ty / norm.clamp(min=1e-6), torch.zeros_like(ty))
+        return c, s
+
+    @staticmethod
+    def _local_to_yarn(v, rot):
+        if rot is None:
+            return v
+        c, s = rot
+        return torch.stack([c * v[:, 0] + s * v[:, 1], -s * v[:, 0] + c * v[:, 1], v[:, 2]], dim=1)
+
+    @staticmethod
+    def _yarn_to_local(v, rot):
+        if rot is None:
+            return v
+        c, s = rot
+        return torch.stack([c * v[:, 0] - s * v[:, 1], s * v[:, 0] + c * v[:, 1], v[:, 2]], dim=1)
+
     def sample(self, ctx, si, sample1, sample2, active=True):
         # ---- 入射方向をヤーン球面座標に変換 ----
-        wi = si.wi.torch().to(device)
+        rot = self._yarn_rotation(si)
+        wi = self._local_to_yarn(si.wi.torch().to(device), rot)
         wi_input = cart_to_yarn_spher(wi)  # (N, 2): (theta_i, phi_i)
 
         # ---- 学習済みネットワークで出射方向をサンプリング ----
@@ -274,7 +376,7 @@ class MyYarnBSDF(mi.BSDF):
         cos_theta_fiber = torch.cos(wo[:, 0]).abs()
 
         # cos(θ_surface) = サーフェス法線との内積 = z成分 = cos(θ_fiber) × sin(φ_fiber)
-        # yarn_to_dir_mi が返す (x,y,z) = (sin θ, cos θ cos φ, cos θ sin φ) なので z = cos_fiber × sin_phi
+        # yarn_spher_to_cart が返す (x,y,z) = (sin θ, cos θ cos φ, cos θ sin φ) なので z = cos_fiber × sin_phi
         cos_theta_surface = torch.cos(wo[:, 0]) * torch.sin(wo[:, 1])
 
         # 有効条件: 極点でなく（Jacobian が 0 でない）
@@ -282,9 +384,9 @@ class MyYarnBSDF(mi.BSDF):
         valid = cos_theta_fiber > 0.00005
         pdf = torch.where(valid, pdf, torch.zeros_like(pdf))
 
-        # ---- ヤーン球面座標 → Mitsuba 3D 方向 ----
+        # ---- ヤーン球面座標 → Mitsuba 3D 方向（シェーディングフレームのローカル座標） ----
         bs = mi.BSDFSample3f()
-        bs.wo = yarn_to_dir_mi(wo)
+        bs.wo = to_mi_vector(self._yarn_to_local(yarn_spher_to_cart(wo), rot))
 
         floatmax = mi.Float(np.array([np.finfo(np.float32).max]))
         # 立体角 pdf = pdf_θφ / cos_fiber（ヤーン座標 Jacobian）
@@ -303,41 +405,30 @@ class MyYarnBSDF(mi.BSDF):
         )
 
         # ---- サンプリング重みの計算 ----
-        # value = brdf_yarn × |cos_surface| / pdf_θφ
-        # TT 方向も |cos_surface| で正の重みを持つ
-        cos_surface_abs = cos_theta_surface.abs()
-        brdf = self.bsdf.eval(wi_input, wo)  # (N,) PyTorch tensor
+        # weight = eval() / pdf_solid_angle = brdf_yarn × cos_fiber / pdf_θφ
+        # eval() = (S_R+S_TT)*cos_fiber なので weight = eval() / bs.pdf
+        # eval_rgb: 反射色・透過色を RGB のまま評価（eval は輝度に潰れており色が失われる）
+        # サンプリング（NN）は輝度で学習したままでよい。pdf が正しければ不偏
+        brdf = self.bsdf.eval_rgb(wi_input, wo)  # (N, 3) = (S_R+S_TT)*cos_fiber
         safe_pdf = pdf.clamp(min=1e-8)
-        value = mi.Color3f(to_mi_float(brdf * cos_surface_abs / safe_pdf)) * self.albedo
+        value = to_mi_color(brdf * (cos_theta_fiber / safe_pdf).unsqueeze(1)) * self.albedo
         value = dr.select(bs.pdf > 0.0, value, mi.Color3f(0))
-
-        # 過大な値をクリップ（数値的な外れ値を除去）
-        pdf_torch    = bs.pdf.torch().to(device)
-        value_scalar = value.torch()[:, 0].to(device)
-        pdf_torch = torch.where(value_scalar < 3.5, pdf_torch,
-                                torch.zeros_like(pdf_torch))
-        bs.pdf = to_mi_float(pdf_torch)
 
         return (bs, dr.select(bs.pdf > 0.0, value, mi.Color3f(0)))
 
     def eval(self, ctx, si, wo, active=True):
-        # ---- 入出射方向をヤーン球面座標に変換して BSDF 値を評価 ----
-        # Mitsuba の規約: eval() は f(wi,wo) × |cos_surface| を返す。
-        # khungurn.eval() = f × cos_fiber なので、
-        #   f × cos_surface = khungurn.eval() × sin(φ_fiber)
-        # （cos_surface = cos_fiber × sin_phi_fiber = khungurn.eval()/f × sin_phi = ... = brdf_yarn × sin_phi / cos_fiber × cos_fiber = brdf_yarn × sin_phi）
-        # ただし cos_fiber で割ることは数値不安定なため、直接 brdf_yarn × sin_phi で計算。
-        wi_t = cart_to_yarn_spher(si.wi.torch().to(device))
-        wo_t = cart_to_yarn_spher(wo.torch().to(device))
-        brdf_yarn = self.bsdf.eval(wi_t, wo_t)  # f × cos_fiber
-        # |cos_surface| = cos_fiber × |sin(φ)|
-        # R 方向（sin_phi > 0）も TT 方向（sin_phi < 0）も abs で正値を返す
-        abs_cos_surface = brdf_yarn * torch.sin(wo_t[:, 1]).abs()
-        return mi.Color3f(to_mi_float(abs_cos_surface)) * self.albedo
+        # khungurn.eval() は (S_R + S_TT) × cos(θ_fiber) を返す。
+        # linearcurve では eval() をそのまま返す（neuralyarn の khungurn と同じ）。
+        rot = self._yarn_rotation(si)
+        wi_t = cart_to_yarn_spher(self._local_to_yarn(si.wi.torch().to(device), rot))
+        wo_t = cart_to_yarn_spher(self._local_to_yarn(wo.torch().to(device), rot))
+        brdf_yarn = self.bsdf.eval_rgb(wi_t, wo_t)  # (N, 3) = (S_R + S_TT) × cos(θ_fiber)
+        return to_mi_color(brdf_yarn) * self.albedo
 
     def pdf(self, ctx, si, wo, active=True):
-        wi_t = cart_to_yarn_spher(si.wi.torch().to(device))
-        wo_t = cart_to_yarn_spher(wo.torch().to(device))
+        rot = self._yarn_rotation(si)
+        wi_t = cart_to_yarn_spher(self._local_to_yarn(si.wi.torch().to(device), rot))
+        wo_t = cart_to_yarn_spher(self._local_to_yarn(wo.torch().to(device), rot))
         pdf = network_pdf_spherical(
             self.D_base, self.D_sample, wo_t, wi_t, T=8
         )
@@ -371,6 +462,7 @@ if __name__ == "__main__":
     if not os.path.exists(scene_path):
         raise FileNotFoundError(f"Scene file does not exist: {scene_path}")
     scene = mi.load_file(scene_path)
+    attach_curve_frames(scene)
 
     SPP = 4
     spp = SPP * parser.passes

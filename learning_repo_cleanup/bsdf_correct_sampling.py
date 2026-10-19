@@ -270,6 +270,9 @@ if __name__ == "__main__":
     # --mcmc_only: MCMCサンプリングだけ実行してnpyを保存し、学習はスキップする
     # GPU不要・tinycudann不要でサンプルだけ先に作りたい場合に使う
     parser.add_argument("--mcmc_only", default = False, type=eval_arg)
+    # --name_suffix: チェックポイントフォルダ名の末尾に付加するタグ（既存を残して別保存するとき使用）
+    # 例: --name_suffix _curve → checkpoints_new/bsdf_26_yarn_curve/
+    parser.add_argument("--name_suffix", default = "", type=str)
     args = parser.parse_args()
 
     mybsdf_scalar = bsdf_materials[args.idx]
@@ -279,8 +282,9 @@ if __name__ == "__main__":
 
     # チェックポイントの保存先フォルダ名をBSDFの種類で分ける
     # 例: bsdf_29_yarn（cotton）、bsdf_9_spherical（既存の表面BSDF）
+    # --name_suffix を指定すると別フォルダに保存（既存チェックポイントを維持したまま再学習できる）
     suffix = "yarn" if is_yarn else "spherical"
-    prefix = "bsdf_" + str(args.idx) + "_" + suffix
+    prefix = "bsdf_" + str(args.idx) + "_" + suffix + args.name_suffix
     save_dir = os.path.join(args.save_dir, prefix)
     file_path = os.path.join(save_dir, "brdf_samples_emcee" + str(args.idx) + ".npy")
 
