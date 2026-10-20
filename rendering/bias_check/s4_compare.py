@@ -41,11 +41,12 @@ fl = np.zeros_like(core); fl[rows.max() + 20:, :] = True
 
 cands = [
     ('old NN render (512 spp, diffusion_bsdf_myresult)', os.path.join(OLD, 'scene_bsdf_fleece_fibers_nn.exr')),
-    ('no fix', os.path.join(OUT, f'scene_bsdf_fleece_fibers_nn_seed0_spp{SPP}.exr')),
+    ('no fix (before the fixes in the original files)', os.path.join(OUT, f'scene_bsdf_fleece_fibers_nn_beforefix_seed0_spp{SPP}.exr')),
     ('fix_base', os.path.join(OUT, f'scene_bsdf_fleece_fibers_nn_fixbase_seed0_spp{SPP}.exr')),
     ('fix_chart', os.path.join(OUT, f'scene_bsdf_fleece_fibers_nn_fixchart_seed0_spp{SPP}.exr')),
     ('fix_base + fix_chart', os.path.join(OUT, f'scene_bsdf_fleece_fibers_nn_fixbase_fixchart_seed0_spp{SPP}.exr')),
     ('fix_base + fix_chart + fix_mis', os.path.join(OUT, f'scene_bsdf_fleece_fibers_nn_fixbase_fixchart_fixmis_seed0_spp{SPP}.exr')),
+    ('NN, fixed original files (no patches)', os.path.join(OUT, f'scene_bsdf_fleece_fibers_nn_seed0_spp{SPP}.exr')),
     ('NN, all fixes (base + chart + MIS + eval)', os.path.join(OUT, f'scene_bsdf_fleece_fibers_nn_fixbase_fixchart_fixmis_fixeval_seed0_spp{SPP}.exr')),
     ('analytic sampler, same pipeline as NN', os.path.join(OUT, f'scene_bsdf_fleece_fibers_analytic_seed0_spp{SPP}.exr')),
     ('analytic sampler + original eval (N_TT bug)', os.path.join(OUT, f'scene_bsdf_fleece_fibers_analytic_origeval_seed0_spp{SPP}.exr')),

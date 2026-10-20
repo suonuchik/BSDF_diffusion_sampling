@@ -1,6 +1,6 @@
 # bias_check — 拡散モデルのサンプラ(MyYarnBSDF)の明るさの偏りの原因調査
 
-既存のファイルは変更していません。補正はすべて `yarn_patches.py` で、読み込み時に差し替える形にしています。
+調査では既存のファイルを変更せず、補正はすべて `yarn_patches.py` で読み込み時に差し替える形で試しました。確認後、本体に反映しています(最後の節)。
 対象は fleece(idx=26、チェックポイント `bsdf_26_yarn_curve`)、繊維の配置は seed 0 です。
 
 ## 結論
@@ -59,9 +59,17 @@ bash run_s6.sh 131072                        # 入射方向の網羅的な調査
 python s4_compare.py 128                     # 輝度比の比較
 ```
 
-## 本体に反映する場合の修正点(未反映)
-1. `NN_cond_pretrain_spherical_one.log_prob` の正規化を `torch.log(torch.exp(log_scale) + self.eps)` にする。
-   - 学習時の尤度にも同じ式が使われているので、再学習するかどうかは別に判断する。
-2. `MyYarnBSDF.sample` / `pdf` を、`yarn_patches.PatchedYarnBSDF` と同じ扱いにする。具体的には、正規化した角度で評価し、2つの対応の PDF を足し、MIS の PDF を統一する。
-3. `utils/mitsuba_brdf_yarn.py` の `_uct_gaussian_pdf` で、μ と σ を使う。
-   - 学習側の `learning_repo_cleanup/utils/mitsuba_brdf_yarn.py` も同様。目標分布の差は 0.17% 程度。
+## 本体への反映(反映済み)
+上の補正は、本体のファイルに反映しました。
+
+| 補正 | 反映したファイル |
+|---|---|
+| 1 | `rendering/utils/model.py` と `learning_repo_cleanup/utils/model.py` の `NN_cond_pretrain_spherical_one.log_prob` |
+| 2 と MIS の統一 | `rendering/bsdf_myresult.py` の `MyYarnBSDF.sample` / `pdf` |
+| 3 | `rendering/utils/mitsuba_brdf_yarn.py` と `learning_repo_cleanup/utils/mitsuba_brdf_yarn.py` の `_gaussian_integral` / `_uct_gaussian_pdf` |
+| 参照画像 | `rendering/render_yarn26_fibers.py` と `_close.py` を `khungurn_fixed` に切り替え。`_orig` は元の版のまま残す |
+
+補足:
+- Khungurn モデルの学習済みネットワークは、再学習していません。偏りの原因は描画時の PDF の計算で、ネットワークはそのままで不偏になります。
+- 反映後は、`yarn_patches.py` のフラグなしの描画(`run_nn_variants.sh 128 none`)が、修正済みの本体の動作になります。
+- 反映前の描画は `out/..._nn_beforefix_...` として残しています。

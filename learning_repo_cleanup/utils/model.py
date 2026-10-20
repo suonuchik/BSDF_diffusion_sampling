@@ -307,8 +307,11 @@ class NN_cond_pretrain_spherical_one(torch.nn.Module):
         return samples
     def log_prob(self,x,x_co):
         loc,log_scale,loc_von,concentration = self.get_param(x_co)
-        eps = (x[:,0:1] - loc) / (torch.exp(log_scale)+self.eps)
-        loggau = -0.5 * 1 * np.log(2 * torch.pi) - torch.sum(log_scale, dim=1) - 0.5 * torch.sum(eps ** 2, dim=1)
+        # sample() の標準偏差は exp(log_scale) + eps なので、正規化も同じ値で行う
+        # (以前は log_scale で正規化していて、PDF が (exp(log_scale)+eps)/exp(log_scale) 倍大きかった)
+        scale = torch.exp(log_scale) + self.eps
+        eps = (x[:,0:1] - loc) / scale
+        loggau = -0.5 * 1 * np.log(2 * torch.pi) - torch.sum(torch.log(scale), dim=1) - 0.5 * torch.sum(eps ** 2, dim=1)
         loc_von = loc_von.flatten()
         concentration = concentration.flatten()
         logvon = torch.distributions.von_mises.VonMises(loc_von,concentration).log_prob(x[:,1])

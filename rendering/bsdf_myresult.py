@@ -7,6 +7,7 @@ from tqdm import tqdm
 import torch
 from utils.model import *
 
+import math
 import os
 import sys
 p = os.path.abspath('.')
@@ -109,6 +110,20 @@ def yarn_spher_to_cart(wo_tp):
     return torch.stack([torch.sin(theta),
                         torch.cos(theta) * torch.cos(phi),
                         torch.cos(theta) * torch.sin(phi)], dim=1)
+
+
+def yarn_canonical(wo_tp):
+    """ODE が出力した (theta, phi) は theta が [-π/2, π/2] の外に出ることがある。
+    同じ方向を表す正規の角度（theta ∈ [-π/2, π/2]）に直す。"""
+    return cart_to_yarn_spher(yarn_spher_to_cart(wo_tp))
+
+
+def yarn_other_chart(wo_tp):
+    """正規の角度 (theta, phi) と同じ方向を表す、もう一方のチャート上の点 (±π - theta, phi + π)。
+    方向の密度は、この2点の (theta, phi) 空間の密度の和になる。"""
+    theta, phi = wo_tp[:, 0], wo_tp[:, 1]
+    other = torch.where(theta >= 0, math.pi - theta, -math.pi - theta)
+    return torch.stack([other, phi + math.pi], dim=1)
 
 
 def to_mi_vector(tensor):
@@ -367,22 +382,33 @@ class MyYarnBSDF(mi.BSDF):
         wi_input = cart_to_yarn_spher(wi)  # (N, 2): (theta_i, phi_i)
 
         # ---- 学習済みネットワークで出射方向をサンプリング ----
-        wo, pdf = network_sampling_spherical(
+        wo_raw, pdf_raw = network_sampling_spherical(
             self.D_base, self.D_sample, wi_input, T=8
         )
-        # wo: (N, 2): (theta_o, phi_o) in yarn coords
+        pdf_raw = pdf_raw.detach()
+        # wo_raw: (N, 2) の (theta_o, phi_o)。ODE で theta が [-π/2, π/2] の外に出ることがあるので、
+        # BSDF の評価と方向の計算には、同じ方向を表す正規の角度 wo を使う
+        wo = yarn_canonical(wo_raw)
+        in_chart = wo_raw[:, 0].abs() <= math.pi / 2
 
-        # cos(θ_fiber) = ヤーン座標の Jacobian（dω = cos(θ)dθdφ）
-        cos_theta_fiber = torch.cos(wo[:, 0]).abs()
+        # 方向の (θ,φ) 空間の密度 = 2つのチャート上の点の密度の和。
+        # サンプルした点は順方向の厳密な pdf_raw、もう一方の点は逆 ODE で求める
+        other = torch.where(in_chart[:, None], yarn_other_chart(wo), wo)
+        pdf = pdf_raw + network_pdf_spherical(self.D_base, self.D_sample, other, wi_input, T=8).detach()
 
-        # cos(θ_surface) = サーフェス法線との内積 = z成分 = cos(θ_fiber) × sin(φ_fiber)
-        # yarn_spher_to_cart が返す (x,y,z) = (sin θ, cos θ cos φ, cos θ sin φ) なので z = cos_fiber × sin_phi
-        cos_theta_surface = torch.cos(wo[:, 0]) * torch.sin(wo[:, 1])
+        # cos(θ_fiber) = ヤーン座標の Jacobian（dω = cos(θ)dθdφ）。正規の角度なので cos >= 0
+        cos_theta_fiber = torch.cos(wo[:, 0]).clamp(min=0.0)
 
-        # 有効条件: 極点でなく（Jacobian が 0 でない）
-        # TT 方向（cos_theta_surface < 0）も許可して透過ローブを有効化
-        valid = cos_theta_fiber > 0.00005
+        # 有効条件: 極点でなく（Jacobian が 0 でない）、pdf が正
+        # TT 方向（表面の法線と逆向き）も許可して透過ローブを有効化
+        valid = (cos_theta_fiber > 0.00005) & torch.isfinite(pdf) & (pdf > 0)
+
+        # MIS 用の pdf: 光源サンプリング側の pdf() と同じ関数（逆 ODE、2つのチャートの和）を使い、
+        # 同じ方向の2つの MIS 重みの和が 1 になるようにする。重み value には厳密な順方向の pdf を使う
+        pdf_mis = self._pdf_theta_phi(wo, wi_input)
+        valid &= torch.isfinite(pdf_mis) & (pdf_mis > 0)
         pdf = torch.where(valid, pdf, torch.zeros_like(pdf))
+        pdf_mis = torch.where(valid, pdf_mis, torch.zeros_like(pdf_mis))
 
         # ---- ヤーン球面座標 → Mitsuba 3D 方向（シェーディングフレームのローカル座標） ----
         bs = mi.BSDFSample3f()
@@ -393,11 +419,11 @@ class MyYarnBSDF(mi.BSDF):
         invcos_theta_fiber = dr.clamp(
             to_mi_float(1.0 / cos_theta_fiber.clamp(min=1e-6)), 1.0, floatmax
         )
-        bs.pdf = to_mi_float(pdf) * invcos_theta_fiber
+        bs.pdf = to_mi_float(pdf_mis) * invcos_theta_fiber
         bs.sampled_component = mi.UInt32(0)
         bs.eta = mi.Float(1.0)  # ヤーンは屈折なし（透過も eta=1）
-        # R か TT かを cos_surface の符号で判定
-        is_refl = to_mi_float((cos_theta_surface > 0).float()) > 0.5
+        # R か TT かを表面の法線成分 z = cos θ × sin φ の符号で判定
+        is_refl = to_mi_float((torch.sin(wo[:, 1]) > 0).float()) > 0.5
         bs.sampled_type = dr.select(
             is_refl,
             mi.UInt32(+mi.BSDFFlags.GlossyReflection),
@@ -406,15 +432,21 @@ class MyYarnBSDF(mi.BSDF):
 
         # ---- サンプリング重みの計算 ----
         # weight = eval() / pdf_solid_angle = brdf_yarn × cos_fiber / pdf_θφ
-        # eval() = (S_R+S_TT)*cos_fiber なので weight = eval() / bs.pdf
+        # eval() = (S_R+S_TT)*cos_fiber なので weight = eval() / pdf_solid_angle
         # eval_rgb: 反射色・透過色を RGB のまま評価（eval は輝度に潰れており色が失われる）
         # サンプリング（NN）は輝度で学習したままでよい。pdf が正しければ不偏
         brdf = self.bsdf.eval_rgb(wi_input, wo)  # (N, 3) = (S_R+S_TT)*cos_fiber
-        safe_pdf = pdf.clamp(min=1e-8)
-        value = to_mi_color(brdf * (cos_theta_fiber / safe_pdf).unsqueeze(1)) * self.albedo
-        value = dr.select(bs.pdf > 0.0, value, mi.Color3f(0))
+        value = brdf * (cos_theta_fiber / pdf.clamp(min=1e-8)).unsqueeze(1)
+        value = torch.where(valid[:, None], value, torch.zeros_like(value))
+        value = to_mi_color(value) * self.albedo
 
         return (bs, dr.select(bs.pdf > 0.0, value, mi.Color3f(0)))
+
+    def _pdf_theta_phi(self, wo_t, wi_t):
+        """正規の角度 wo_t の方向の (θ,φ) 空間の密度（逆 ODE、2つのチャート上の点の和）"""
+        pdf = network_pdf_spherical(self.D_base, self.D_sample, wo_t, wi_t, T=8)
+        pdf = pdf + network_pdf_spherical(self.D_base, self.D_sample, yarn_other_chart(wo_t), wi_t, T=8)
+        return pdf.detach()
 
     def eval(self, ctx, si, wo, active=True):
         # khungurn.eval() は (S_R + S_TT) × cos(θ_fiber) を返す。
@@ -429,9 +461,7 @@ class MyYarnBSDF(mi.BSDF):
         rot = self._yarn_rotation(si)
         wi_t = cart_to_yarn_spher(self._local_to_yarn(si.wi.torch().to(device), rot))
         wo_t = cart_to_yarn_spher(self._local_to_yarn(wo.torch().to(device), rot))
-        pdf = network_pdf_spherical(
-            self.D_base, self.D_sample, wo_t, wi_t, T=8
-        )
+        pdf = self._pdf_theta_phi(wo_t, wi_t)
         # (θ,φ) 空間の pdf → 立体角 pdf へ変換
         cos_theta_o = torch.cos(wo_t[:, 0]).abs().clamp(min=1e-6)
         floatmax = mi.Float(np.array([np.finfo(np.float32).max]))

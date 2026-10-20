@@ -52,16 +52,16 @@ def _std_gaussian_cdf(x):
     return 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
 
 
-def _gaussian_integral(a, b):
-    """標準正規分布の [a, b] 上の積分 Φ(b) - Φ(a)
+def _gaussian_integral(a, b, mu, sigma):
+    """平均 mu・標準偏差 sigma のガウス分布の [a, b] 上の積分 Φ((b-mu)/σ) - Φ((a-mu)/σ)
 
-    【なぜ mu, sigma を引数に取らないか】
-    Khungurn 論文の実装では gaussian_cdf が mu, sigma を無視して
-    標準正規 CDF を返す実装になっている。ここではその挙動を忠実に再現する。
-    （a, b が [-π, π] のとき Φ(π)-Φ(-π) ≈ 1.0 なので uniform_weight ≈ 0 になる）
+    移植元の neuralyarn の bsdf/khungurn.py は gaussian_cdf で mu, sigma を無視しており、
+    以前はここでもその挙動を再現していた。その場合 Φ(π)-Φ(-π) = 0.9983 となり、
+    N_TT の積分が 1.0017 になって、透過のたびにエネルギーが 0.17% 増えていた
+    （rendering/bias_check/README.md）。修正版 khungurn_fixed.py に合わせて mu, sigma を使う。
     """
-    a_t = torch.tensor(a, dtype=torch.float32)
-    b_t = torch.tensor(b, dtype=torch.float32)
+    a_t = torch.as_tensor((a - mu) / sigma, dtype=torch.float32)
+    b_t = torch.as_tensor((b - mu) / sigma, dtype=torch.float32)
     return _std_gaussian_cdf(b_t) - _std_gaussian_cdf(a_t)
 
 
@@ -72,7 +72,7 @@ def _uct_gaussian_pdf(x, mu, sigma, a, b):
     この uct バージョンでは代わりに一様分布 U(a, b) を混合することで
     必ずサポート内にサンプルが収まるようにする（重要サンプリングの安定化）。
     """
-    uniform_weight = (1.0 - _gaussian_integral(a, b)) / (b - a)
+    uniform_weight = (1.0 - _gaussian_integral(a, b, mu, sigma)) / (b - a)
     return _gaussian_pdf(x, mu, sigma) + uniform_weight
 
 

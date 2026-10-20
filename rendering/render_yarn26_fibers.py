@@ -42,8 +42,11 @@ except ImportError:  # neuralyarn 環境には tqdm が入っていないこと�
 from scipy.spatial.transform import Rotation as Rot
 from mitsuba import ScalarTransform4f as sT
 
-# Register khungurn BSDF plugin (side effect: mi.register_bsdf('khungurn', ...))
-import bsdf.khungurn  # noqa: E402
+# Register the corrected khungurn BSDF (side effect: mi.register_bsdf('khungurn_fixed', ...)).
+# neuralyarn の bsdf/khungurn.py はサンプリングにバグがあり、繊維1回の反射ごとに暗くなる
+# (fleece で糸の部分が約 11% 暗い)。修正版 analysis/khungurn_bias/khungurn_fixed.py を使う。
+sys.path.insert(0, os.path.join(NEURALYARN, 'analysis', 'khungurn_bias'))
+import khungurn_fixed  # noqa: E402,F401
 
 # -----------------------------------------------------------------------
 # Geometry helpers (from neuralyarn/utils/geometry.py, inlined to avoid
@@ -196,7 +199,7 @@ scene = mi.load_dict({
         'type': 'linearcurve',
         'filename': curves_path,
         'bsdf': {
-            'type': 'khungurn',
+            'type': 'khungurn_fixed',
             'reflectance':   {'type': 'rgb', 'value': mat['R']},
             'transmittance': {'type': 'rgb', 'value': mat['TT']},
             'r_longwidth':   mat['R_long'],
